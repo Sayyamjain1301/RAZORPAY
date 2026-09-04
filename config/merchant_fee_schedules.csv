@@ -1,0 +1,2 @@
+merchant_id,gateway_fee_rates,tds_rates,gst_on_fee
+premium_merchant_demo,0.015;0.019,0.001;0.02,0.18

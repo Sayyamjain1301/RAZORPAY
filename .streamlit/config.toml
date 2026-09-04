@@ -1,0 +1,40 @@
+# Razorpay brand system — exact hex per spec. No other colors used anywhere.
+[theme]
+base = "light"
+primaryColor = "#0D94FB"              # Dodger Blue — the only accent
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"  # Off-white — cards, stripe-free tables
+textColor = "#1A1F2B"                 # Near-black
+borderColor = "#E5E8EC"               # Light gray, 1px only
+font = "sans serif"
+baseFontSize = 15
+baseRadius = "0.375rem"
+
+redColor = "#DC2626"
+greenColor = "#16A34A"
+orangeColor = "#D97706"
+blueColor = "#0D94FB"
+
+dataframeHeaderBackgroundColor = "#F5F7FA"
+metricValueFontSize = "2.1rem"
+# metricValueFontWeight / metricValueColor / metricLabelFontSize are not
+# confirmed-valid Streamlit theme keys in this version — controlled via CSS
+# in recon_agent/ui_theme.py instead, which is guaranteed to apply.
+
+[[theme.fontFaces]]
+family = "Inter"
+url = "https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMa1ZL7.woff2"
+weight = 400
+
+[[theme.fontFaces]]
+family = "Inter"
+url = "https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMa2JL7.woff2"
+weight = 600
+
+[[theme.fontFaces]]
+family = "Inter"
+url = "https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMa45L7.woff2"
+weight = 700
+
+[server]
+headless = true

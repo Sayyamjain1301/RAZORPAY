@@ -1,0 +1,1152 @@
+"""
+Streamlit console for the Payment Reconciliation Agent.
+
+Visual system: Razorpay's brand palette + a restrained motion layer where
+every animation communicates a state change (recon_agent/{ui_theme,motion}.py
+— see motion.py's module docstring for how each animation is implemented
+within Streamlit's rerun model, and why). The matching pipeline (data_gen.py,
+recon_agent/matcher.py, recon_agent/llm_reasoner.py) is unchanged.
+
+Run:  streamlit run app.py
+"""
+import os
+import time
+from datetime import datetime, timezone
+
+import pandas as pd
+import streamlit as st
+
+from data_gen import generate
+from recon_agent import anomaly, assistant, chat_widget, motion, ops, rules as rules_mod
+from recon_agent.audit import AuditLog, entries_for_txn, load_chain, replay_txn, verify_chain
+from recon_agent.matcher import load_settlements, run_reconciliation
+from recon_agent.ui_theme import (CSS, STATUS_LABEL, autonomy_badge, band_for, band_row,
+                                  because_sentence, confidence_pill, fmt_inr, icon,
+                                  mini_pipeline, status_row, tag, trend_arrow)
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+INV_CSV = os.path.join(DATA_DIR, "invoices.csv")
+SETTLE_CSV = os.path.join(DATA_DIR, "settlements.csv")
+GT_CSV = os.path.join(DATA_DIR, "ground_truth.csv")
+DED_CSV = os.path.join(DATA_DIR, "deduction_truth.csv")
+AUDIT_PATH = os.path.join(DATA_DIR, "audit_log.jsonl")
+
+CURRENT_USER = os.environ.get("USER", "local_user")
+LAYER_LABEL = {
+    "exact_reference+deduction_engine": "Exact reference match",
+    "exact_reference+partial_payment": "Exact reference match",
+    "exact_reference_batch+deduction_engine": "Exact reference match (batch)",
+    "anchored_batch_completion": "Batch reconciliation",
+    "amount_date_subset_sum": "Batch reconciliation",
+    "llm_investigator": "Exception investigator",
+}
+
+st.set_page_config(page_title="Reconciliation — Razorpay", layout="wide",
+                    page_icon=":material/receipt_long:", initial_sidebar_state="expanded")
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown(motion.CSS, unsafe_allow_html=True)
+
+# ---- st.secrets fallback for ANTHROPIC_API_KEY: env var always wins -------
+# recon_agent/{llm_reasoner,assistant}.py both read os.environ directly, so
+# rather than plumb a second lookup path through every module, we bridge
+# st.secrets into the environment once, here, only when the env var is
+# genuinely absent — every downstream `os.environ.get(...)` then just works,
+# and precedence (env > secrets) is enforced by only ever filling a gap,
+# never overwriting. `st.secrets` raises if no secrets.toml exists at all,
+# which is the normal case for most local dev — that's expected, not a bug.
+if not os.environ.get("ANTHROPIC_API_KEY"):
+    try:
+        _secret_key = st.secrets.get("ANTHROPIC_API_KEY")
+        if _secret_key:
+            os.environ["ANTHROPIC_API_KEY"] = _secret_key
+    except Exception:
+        pass  # no secrets.toml configured — fall through to the no-key path
+
+st.session_state.setdefault("dark_mode", False)
+if st.session_state["dark_mode"]:
+    st.markdown("""<style>
+        [data-testid="stAppViewContainer"] { background: #0F1216 !important; }
+        [data-testid="stSidebar"] { background: #14171C !important; }
+        .rp-card { background: #191D22 !important; border-color: #2A2F36 !important; }
+        body, p, span, div, label, li { color: #E6E9EE; }
+        [data-testid="stMetricLabel"] { color: #8C94A0 !important; }
+    </style>""", unsafe_allow_html=True)
+
+for key, default in [
+    ("confirmed", set()), ("rejected", set()), ("selected_txn", None),
+    ("run_id", None), ("bulk_selected", set()), ("status_filter", []),
+    ("band_filter", []), ("layer_filter", []), ("search_text", ""),
+    ("last_panel_txn", None), ("seen_txn_ids", set()), ("kpi_animated_runs", set()),
+    ("confirm_anim", None), ("active_tab", "Overview"),
+]:
+    st.session_state.setdefault(key, default)
+
+
+def enrich_settlements(settlements: list[dict], settle_csv_path: str) -> dict[str, dict]:
+    raw = {r["txn_id"]: r for r in load_settlements(settle_csv_path)}
+    enriched = {}
+    for s in settlements:
+        r = raw.get(s["txn_id"], {})
+        narration = r.get("narration", "")
+        tokens = [t for t in narration.replace("/", " ").replace("-", " ").split() if t.isalpha()]
+        guess = tokens[-1].title() if tokens else None
+        enriched[s["txn_id"]] = {
+            "txn_date": r.get("txn_date"), "amount": r.get("amount"),
+            "narration": narration, "narration_customer_guess": guess,
+        }
+    return enriched
+
+
+def ticker_lines(metrics: dict, settlements: list[dict]) -> list[str]:
+    """Real per-layer counts from the run that just finished (#5) — never
+    fabricated. Grouped into the same three buckets the README's architecture
+    diagram uses, so the ticker teaches the real pipeline shape."""
+    from collections import Counter
+    counts = Counter(s["layer"] for s in settlements)
+    exact = (counts.get("exact_reference+deduction_engine", 0)
+            + counts.get("exact_reference+partial_payment", 0)
+            + counts.get("exact_reference_batch+deduction_engine", 0))
+    batch = counts.get("anchored_batch_completion", 0) + counts.get("amount_date_subset_sum", 0)
+    investigator = counts.get("llm_investigator", 0)
+    lines = ["Normalizing records…"]
+    if exact:
+        lines.append(f"Exact reference match — {exact} resolved")
+    if batch:
+        lines.append(f"Batch reconciliation — {batch} resolved")
+    if investigator:
+        lines.append(f"Exception investigator — {investigator} flagged")
+    return lines
+
+
+def start_confirm_animation(txn_ids: list[str], layer_by_txn: dict[str, str]) -> None:
+    """Entry point shared by single Accept, grouped bulk approve, and the
+    bulk-selection bar's Confirm — sets state and reruns; the actual state
+    mutation happens once, at the end of the Reconciliation tab, after the
+    animation has had time to play (#3, #4)."""
+    st.session_state["confirm_anim"] = {"txn_ids": list(txn_ids), "layer_by_txn": layer_by_txn}
+    st.rerun()
+
+
+# ==========================================================================
+# SIDEBAR
+# ==========================================================================
+with st.sidebar:
+    st.markdown("**Data**")
+    n = st.slider("Invoices to generate", 30, 150, 60, step=10)
+    seed = st.number_input("Random seed", value=42, step=1)
+    if st.button("Regenerate synthetic data", width="stretch"):
+        generate(int(n), int(seed), DATA_DIR)
+        for k in ("recon_out", "confirmed", "rejected", "selected_txn", "run_id",
+                 "seen_txn_ids", "kpi_animated_runs", "processing_reveal"):
+            st.session_state.pop(k, None)
+        st.success(f"Generated {n} invoices and settlement transactions.")
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    use_llm = st.checkbox("Use live Claude API for exception investigation", value=api_key_present)
+    if use_llm and not api_key_present:
+        st.caption("No ANTHROPIC_API_KEY — falling back to the rule-based investigator.")
+    elif use_llm:
+        st.caption("ANTHROPIC_API_KEY detected — live Claude calls enabled.")
+
+    if st.session_state.get("processing_reveal"):
+        # ---- #5: pipeline ticker replaces the button while "processing" ---
+        motion.pipeline_ticker(st.session_state["processing_reveal"]["lines"],
+                               height=28 * (len(st.session_state["processing_reveal"]["lines"]) + 1))
+    elif st.button("Run reconciliation", type="primary", width="stretch"):
+        dup = ops.check_duplicate_ingestion(DATA_DIR, SETTLE_CSV) if os.path.exists(SETTLE_CSV) else None
+        _t0 = time.perf_counter()
+        out = run_reconciliation(
+            invoices_csv=INV_CSV, settlements_csv=SETTLE_CSV,
+            ground_truth_csv=GT_CSV if os.path.exists(GT_CSV) else None,
+            deduction_truth_csv=DED_CSV if os.path.exists(DED_CSV) else None,
+            use_llm=use_llm,
+        )
+        st.session_state["wall_clock_ms"] = round((time.perf_counter() - _t0) * 1000, 1)
+        run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+        st.session_state["run_id"] = run_id
+        st.session_state["recon_out"] = out
+        st.session_state["confirmed"] = set()
+        st.session_state["rejected"] = set()
+        st.session_state["dup_check"] = dup
+        st.session_state["enriched"] = enrich_settlements(out["settlements"], SETTLE_CSV)
+        st.session_state["seen_txn_ids"] = set()
+
+        audit = AuditLog(AUDIT_PATH, run_id=run_id, user=CURRENT_USER,
+                         model=os.environ.get("RECON_LLM_MODEL", "claude-3-5-haiku-20241022"))
+        audit.write_all(out["settlements"])
+
+        unresolved = [s["txn_id"] for s in out["settlements"] if s["status"] != "matched"]
+        ops.touch_first_seen(DATA_DIR, unresolved)
+        st.session_state["drift"] = ops.check_drift(DATA_DIR, out["settlements"])
+        rules_mod.record_run(DATA_DIR, out["metrics"], out["settlements"])
+        ops.prepare_run(DATA_DIR, run_id, CURRENT_USER)
+
+        lines = ticker_lines(out["metrics"], out["settlements"])
+        st.session_state["processing_reveal"] = {
+            "lines": lines,
+            "duration_s": min(motion.TICKER_CAP_MS, len(lines) * motion.TICKER_STAGGER_MS + 400) / 1000,
+        }
+        st.rerun()
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    st.markdown("**Autonomy per rule**")
+    _rules = rules_mod.load_rules(DATA_DIR)
+    for layer, rule in _rules.items():
+        if not rule.tunable:
+            continue
+        new_autonomy = st.selectbox(
+            rule.label, rules_mod.AUTONOMY_LEVELS,
+            index=rules_mod.AUTONOMY_LEVELS.index(rule.autonomy),
+            format_func=lambda a: rules_mod.AUTONOMY_LABEL[a], key=f"autonomy_{layer}")
+        new_threshold = rule.threshold
+        if new_autonomy == "auto_under_threshold":
+            new_threshold = st.slider("Confidence floor to auto-confirm", 50, 99, rule.threshold, key=f"thr_{layer}")
+        if new_autonomy != rule.autonomy or new_threshold != rule.threshold:
+            _rules[layer] = rules_mod.Rule(layer=layer, label=rule.label, autonomy=new_autonomy,
+                                           threshold=new_threshold, tunable=True)
+            rules_mod.save_rules(DATA_DIR, _rules)
+            st.rerun()
+
+# --------------------------------------------------------------------------
+# Empty states
+# --------------------------------------------------------------------------
+if not os.path.exists(INV_CSV):
+    st.info("No data yet — use Regenerate synthetic data in the sidebar to get started.")
+    st.stop()
+if "recon_out" not in st.session_state:
+    # ---- STATE 1: intent preview, replacing the old blank info banner -----
+    _rules_preview = rules_mod.load_rules(DATA_DIR)
+    _llm_rule = _rules_preview.get(rules_mod.TUNABLE_LAYER)
+    if _llm_rule and _llm_rule.autonomy == "suggest_only":
+        _step5 = "LLM investigator (suggest-only)"
+    elif _llm_rule and _llm_rule.autonomy == "auto_under_threshold":
+        _step5 = f"LLM investigator (auto-confirm ≥ {_llm_rule.threshold})"
+    else:
+        _step5 = "LLM investigator (auto-confirm)"
+
+    def _row_count(path: str) -> int:
+        with open(path) as f:
+            return max(0, sum(1 for _ in f) - 1)
+
+    _n_inv = _row_count(INV_CSV)
+    _n_settle = _row_count(SETTLE_CSV)
+
+    st.markdown(
+        f'<div class="rp-card">'
+        f'<div style="display:flex;align-items:center;gap:8px;font-weight:600;color:#012652">'
+        f'{icon("check-circle", 16)}What happens when you click Run</div>'
+        f'{mini_pipeline(_step5)}'
+        f'<div style="color:#6B7280;font-size:12.5px;margin-top:6px">'
+        f'{_n_inv} invoices × {_n_settle} settlements, seed {seed} — nothing is written until you '
+        f'confirm results below.</div></div>',
+        unsafe_allow_html=True,
+    )
+    chat_widget.render("pre_run", use_llm=use_llm)
+    st.stop()
+
+# ---- #5/#6: while the ticker plays in the sidebar, show skeleton here too -
+if st.session_state.get("processing_reveal"):
+    with st.container(key="topnav"):
+        st.markdown("##### Reconciliation")
+        st.caption("Processing…")
+    st.markdown(motion.skeleton_rows(8), unsafe_allow_html=True)
+    time.sleep(st.session_state["processing_reveal"]["duration_s"])
+    del st.session_state["processing_reveal"]
+    st.rerun()
+    st.stop()
+
+out = st.session_state["recon_out"]
+metrics = out["metrics"]
+settlements = out["settlements"]
+invoices = out["invoices"]
+enriched = st.session_state.get("enriched", {})
+rules = rules_mod.load_rules(DATA_DIR)
+auto_confirmed_by_rule = rules_mod.apply_autonomy(settlements, rules)
+run_id = st.session_state["run_id"]
+locked = ops.is_locked(DATA_DIR, run_id)
+confirm_anim = st.session_state.get("confirm_anim")
+confirm_anim_ids = confirm_anim["txn_ids"] if confirm_anim else []
+
+
+def effective_status(s: dict) -> str:
+    if s["txn_id"] in st.session_state["rejected"]:
+        return "exception"
+    if s["status"] == "pending_confirmation" and (
+            s["txn_id"] in st.session_state["confirmed"] or s["txn_id"] in auto_confirmed_by_rule):
+        return "matched"
+    return s["status"]
+
+
+def pct(key: str) -> str:
+    v = metrics.get(key)
+    return f"{v*100:.1f}%" if v is not None else "n/a"
+
+
+def badge_wrap(txn_id: str, html: str) -> str:
+    """#8: soft fade-in the first time a decision badge is ever rendered in
+    this run; every subsequent rerun (filter change, etc.) shows it flat,
+    with no replay."""
+    fresh = txn_id not in st.session_state["seen_txn_ids"]
+    cls = "rp-badge-fresh" if fresh else ""
+    return f'<span class="{cls}">{html}</span>'
+
+
+# ==========================================================================
+# TOP NAV
+# ==========================================================================
+with st.container(key="topnav"):
+    nc1, nc2 = st.columns([6, 1])
+    with nc1:
+        st.markdown("##### Reconciliation")
+        st.caption(f"Run {run_id}  ·  {metrics['total_settlements']} records")
+    with nc2:
+        toggle_icon = ":material/light_mode:" if st.session_state["dark_mode"] else ":material/dark_mode:"
+        if st.button("", icon=toggle_icon, key="theme_toggle", help="Toggle dark mode"):
+            st.session_state["dark_mode"] = not st.session_state["dark_mode"]
+            st.rerun()
+
+dup = st.session_state.get("dup_check")
+if dup and dup["is_duplicate"]:
+    st.warning(f"Duplicate ingestion detected — this settlements file (hash `{dup['hash']}`) "
+              f"has been processed {dup['times_seen_before']} time(s) before.")
+
+drift = st.session_state.get("drift") or []
+if drift:
+    with st.expander(f"{len(drift)} reconciliation(s) drifted from their last run"):
+        st.caption("Same txn_id, different outcome than last time — investigate before trusting either run.")
+        for d in drift[:15]:
+            st.markdown(f"`{d['txn_id']}`: was **{d['was']['status']}** → **{d['now']['status']}**")
+
+# ==========================================================================
+# #10 — custom tab bar with a sliding Dodger Blue underline
+# ==========================================================================
+TAB_NAMES = ["Overview", "Reconciliation", "Settlements", "Model diagnostics", "Reports", "Settings"]
+active = st.session_state["active_tab"]
+active_idx = TAB_NAMES.index(active) if active in TAB_NAMES else 0
+n_tabs = len(TAB_NAMES)
+
+st.markdown(
+    f'<div class="rp-tabbar" style="position:relative">'
+    f'<div class="rp-tabbar-underline" style="left:{active_idx/n_tabs*100:.4f}%;'
+    f'width:{100/n_tabs:.4f}%"></div></div>',
+    unsafe_allow_html=True,
+)
+tab_cols = st.columns(n_tabs)
+for i, name in enumerate(TAB_NAMES):
+    with tab_cols[i]:
+        st.markdown(f'<div class="rp-tabbtn{" rp-tabbtn-active" if i == active_idx else ""}">',
+                   unsafe_allow_html=True)
+        if st.button(name, key=f"tabbtn_{name}", width="stretch", type="tertiary"):
+            st.session_state["active_tab"] = name
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+active_tab = st.session_state["active_tab"]
+
+# ---- persistent floating assistant — every tab of the dashboard state ----
+_focused_txn = None
+_expanded = st.session_state.get("expanded_rows", set())
+if len(_expanded) == 1:
+    _focused_txn = next(iter(_expanded))
+chat_widget.render("dashboard", metrics=metrics, settlements=settlements,
+                   focused_txn=_focused_txn, active_tab=active_tab, use_llm=use_llm)
+
+# ==========================================================================
+# OVERVIEW
+# ==========================================================================
+if active_tab == "Overview":
+    history = rules_mod.load_run_history(DATA_DIR)
+    prev_rate = history[-2]["auto_match_rate"] if len(history) >= 2 else None
+    delta = f"{(metrics['auto_match_rate'] - prev_rate)*100:+.1f}pp vs last run" if prev_rate is not None else None
+
+    hc, sc = st.columns([1, 2])
+    with hc:
+        st.caption("Auto-match rate")
+        # ---- #1: hero KPI count-up, once per run_id, never on re-render ---
+        if run_id not in st.session_state["kpi_animated_runs"]:
+            motion.count_up(metrics["auto_match_rate"] * 100, decimals=1, suffix="%",
+                            font_size="2.3rem", color="#0D94FB", height=55, elem_id=f"kpi_{run_id}")
+            st.session_state["kpi_animated_runs"].add(run_id)
+        else:
+            st.markdown(f"<div style='font:700 2.3rem/1.1 Inter,sans-serif;color:#0D94FB;"
+                       f"font-variant-numeric:tabular-nums'>{metrics['auto_match_rate']*100:.1f}%</div>",
+                       unsafe_allow_html=True)
+        if delta:
+            st.caption(delta)
+    with sc:
+        s1, s2, s3 = st.columns(3)
+        s1.markdown(f"<div class='rp-empty'>Exceptions</div><div style='font-size:1.3rem;color:#1A1F2B'>"
+                   f"{metrics['exception']}</div>", unsafe_allow_html=True)
+        s2.markdown(f"<div class='rp-empty'>Pending review</div><div style='font-size:1.3rem;color:#1A1F2B'>"
+                   f"{metrics['pending_confirmation']}</div>", unsafe_allow_html=True)
+        s3.markdown(f"<div class='rp-empty'>Records</div><div style='font-size:1.3rem;color:#1A1F2B'>"
+                   f"{metrics['total_settlements']}</div>", unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Precision", pct("precision"))
+    c6.metric("Recall", pct("recall"))
+    c7.metric("Deduction-hypothesis accuracy", pct("deduction_hypothesis_accuracy"))
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    dr = pd.to_datetime([enriched.get(s["txn_id"], {}).get("txn_date") for s in settlements
+                        if enriched.get(s["txn_id"], {}).get("txn_date")])
+    if len(dr):
+        st.date_input("Date range", value=(dr.min().date(), dr.max().date()),
+                      min_value=dr.min().date(), max_value=dr.max().date())
+
+    st.markdown("**Resolution layer breakdown**")
+    layer_counts = pd.Series([s["layer"] for s in settlements]).value_counts()
+    st.bar_chart(layer_counts, color="#0D94FB")
+
+    if len(history) >= 2:
+        st.markdown("**Auto-match rate trend across runs**")
+        st.line_chart(pd.DataFrame(history)[["auto_match_rate"]])
+
+# ==========================================================================
+# RECONCILIATION
+# ==========================================================================
+elif active_tab == "Reconciliation":
+    # ======================================================================
+    # STATE 2 — results pane. KPI row -> clickable layer bar -> 4 tabs ->
+    # a pinned, collapsible activity-log drawer.
+    # ======================================================================
+    history = rules_mod.load_run_history(DATA_DIR)
+    prev_run = history[-2] if len(history) >= 2 else None
+
+    def _delta_pp(key: str):
+        if prev_run is None or metrics.get(key) is None or prev_run.get(key) is None:
+            return None
+        return (metrics[key] - prev_run[key]) * 100
+
+    KPI_DEFS = [
+        ("Auto-match rate", "auto_match_rate"), ("Resolved rate", "resolved_rate"),
+        ("Precision", "precision"), ("Recall", "recall"),
+        ("Deduction accuracy", "deduction_hypothesis_accuracy"),
+    ]
+    kcols = st.columns(5)
+    for col, (label, key) in zip(kcols, KPI_DEFS):
+        val = metrics.get(key)
+        val_str = f"{val*100:.1f}%" if val is not None else "n/a"
+        with col:
+            st.markdown(
+                f'<div class="rp-card" style="padding:12px 14px">'
+                f'<div style="display:flex;align-items:center;gap:6px;color:#6B7280;font-size:11.5px">'
+                f'{icon("check-circle", 13)}{label}</div>'
+                f'<div class="rp-amount" style="font-size:1.4rem;color:#012652;margin-top:3px">{val_str}</div>'
+                f'<div style="margin-top:3px">{trend_arrow(_delta_pp(key))}</div>'
+                f'</div>', unsafe_allow_html=True)
+
+    _run_ts = run_id.replace("run_", "")
+    try:
+        from datetime import datetime as _dt
+        _run_ts = _dt.strptime(_run_ts, "%Y%m%dT%H%M%S").strftime("%Y-%m-%d %H:%M:%S UTC")
+    except ValueError:
+        pass
+    st.markdown(
+        f'<p style="color:#6B7280;font-size:12px;margin:10px 0 16px">'
+        f'Run on seed {seed} · n={metrics["total_settlements"]} · {_run_ts} · not live data</p>',
+        unsafe_allow_html=True)
+
+    # ---- slim cost/timing strip ----------------------------------------
+    # Claude 3.5 Haiku published rates (USD/M tokens) as of this model's
+    # release; illustrative, not fetched live. FX: 88 INR/USD, same constant
+    # used throughout this project.
+    _HAIKU_IN, _HAIKU_OUT, _FX = 0.80, 4.00, 88.0
+    _det_n = sum(1 for s in settlements if s["source"] != "llm")
+    _llm_n = sum(1 for s in settlements if s["source"] == "llm")
+    _in_tok = sum(s.get("input_tokens", 0) for s in settlements)
+    _out_tok = sum(s.get("output_tokens", 0) for s in settlements)
+    _usd = _in_tok / 1e6 * _HAIKU_IN + _out_tok / 1e6 * _HAIKU_OUT
+    _wall_ms = st.session_state.get("wall_clock_ms")
+    _wall_str = f"{_wall_ms:g}ms" if _wall_ms is not None else "n/a"
+    st.markdown(
+        f'<div class="rp-card rp-mono" style="padding:8px 14px;font-size:11.5px;'
+        f'color:#1A1F2B;background:#F5F7FA;margin-bottom:16px">'
+        f'Deterministic: {_det_n} records (₹0 cost) · '
+        f'LLM: {_llm_n} records ({_in_tok + _out_tok} tokens, ₹{_usd*_FX:.2f}) · '
+        f'Wall-clock: {_wall_str}</div>',
+        unsafe_allow_html=True)
+
+    # ---- clickable layer-breakdown bar --------------------------------
+    from collections import Counter as _Counter
+    layer_counts = _Counter(s["layer"] for s in settlements)
+    total_n = sum(layer_counts.values()) or 1
+    LAYER_COLOR = {
+        "exact_reference+deduction_engine": "#0D94FB",
+        "exact_reference+partial_payment": "#4DB1FC",
+        "exact_reference_batch+deduction_engine": "#7EC5FD",
+        "anchored_batch_completion": "#012652",
+        "amount_date_subset_sum": "#2D5C8A",
+        "llm_investigator": "#B9C6D6",
+    }
+    st.session_state.setdefault("layer_filter_active", None)
+    segs_html = "".join(
+        f'<div class="rp-layerbar-seg" style="width:{c/total_n*100:.3f}%;'
+        f'background:{LAYER_COLOR.get(l, "#B9C6D6")}"></div>'
+        for l, c in layer_counts.items()
+    )
+    st.markdown(f'<div class="rp-layerbar">{segs_html}</div>', unsafe_allow_html=True)
+    leg_cols = st.columns(len(layer_counts))
+    for col, (l, c) in zip(leg_cols, layer_counts.items()):
+        with col:
+            is_active = st.session_state["layer_filter_active"] == l
+            if st.button(f"{LAYER_LABEL.get(l, l)} ({c})", key=f"layerseg_{l}",
+                        type="primary" if is_active else "tertiary", width="stretch"):
+                st.session_state["layer_filter_active"] = None if is_active else l
+                st.rerun()
+    if st.session_state["layer_filter_active"]:
+        st.caption(f"Filtered to layer: `{st.session_state['layer_filter_active']}` "
+                  f"— click the segment again to clear.")
+
+    def _layer_ok(s: dict) -> bool:
+        active = st.session_state["layer_filter_active"]
+        return active is None or s["layer"] == active
+
+    # ---- precision vs. auto-approval tradeoff card ----------------------
+    if os.path.exists(GT_CSV):
+        from recon_agent.matcher import load_ground_truth
+        _gt = load_ground_truth(GT_CSV)
+        _rule = rules.get("llm_investigator")
+        _default_tau = _rule.threshold if _rule and _rule.autonomy == "auto_under_threshold" else 85
+        with st.container(border=True):
+            st.markdown("**Precision vs. auto-approval tradeoff**")
+            _curve = rules_mod.threshold_sweep(settlements, _gt)
+            if any(c["n"] > 0 for c in _curve):
+                import altair as alt
+                _cdf = pd.DataFrame(_curve)
+                _tau_pick = st.slider("Threshold", 0, 100, _default_tau, step=5, key="tradeoff_tau",
+                                      help="Draggable threshold marker — default matches the "
+                                           "configured precision floor.")
+                _base = alt.Chart(_cdf).encode(x=alt.X("tau:Q", title="Confidence threshold"))
+                _line_p = _base.mark_line(color="#16A34A").encode(
+                    y=alt.Y("precision:Q", title="Rate", axis=alt.Axis(format="%")))
+                _line_c = _base.mark_line(color="#0D94FB").encode(y="coverage:Q")
+                _rule_mark = alt.Chart(pd.DataFrame({"tau": [_tau_pick]})).mark_rule(
+                    color="#012652", strokeDash=[3, 2]).encode(x="tau:Q")
+                st.altair_chart((_line_p + _line_c + _rule_mark).properties(height=180),
+                                width="stretch")
+                _row = min(_curve, key=lambda r: abs(r["tau"] - _tau_pick))
+                st.caption(f"At this threshold: {_row['coverage']*100:.1f}% auto-approved, "
+                          f"{_row['precision']*100:.1f}% precision (n={_row['n']}). "
+                          f"Blue = auto-approval rate, green = precision.")
+            else:
+                st.markdown('<p class="rp-empty">Not enough LLM-layer volume in this batch to '
+                          'chart a tradeoff curve.</p>', unsafe_allow_html=True)
+
+    # ---- search / filter bar --------------------------------------------
+    fc1, fc2, fc3 = st.columns([2, 1, 1])
+    with fc1:
+        search_q = st.text_input("Search", key="recon_search", icon=":material/search:",
+                                 label_visibility="collapsed", placeholder="Search txn or invoice ID")
+    with fc2:
+        band_filter = st.selectbox("Confidence band", ["All", "High", "Medium", "Low"],
+                                   key="recon_band_filter", label_visibility="collapsed")
+    with fc3:
+        layer_options = ["All"] + sorted({s["layer"] for s in settlements})
+        layer_filter_dd = st.selectbox("Layer", layer_options, key="recon_layer_dd",
+                                       format_func=lambda l: LAYER_LABEL.get(l, l) if l != "All" else "All layers",
+                                       label_visibility="collapsed")
+    if layer_filter_dd != "All":
+        st.session_state["layer_filter_active"] = layer_filter_dd
+
+    def _search_ok(s: dict) -> bool:
+        q = search_q.strip().upper()
+        return not q or q in s["txn_id"].upper() or any(q in i.upper() for i in s["matched_invoice_ids"])
+
+    def _band_ok(s: dict) -> bool:
+        if band_filter == "All":
+            return True
+        c = s["confidence"]
+        tier = "High" if c >= 80 else ("Medium" if c >= 55 else "Low")
+        return tier == band_filter
+
+    def autonomy_label_for(s: dict) -> str:
+        if s["layer"] != "llm_investigator":
+            return "Auto-closed"
+        rule = rules.get("llm_investigator")
+        if s["txn_id"] in auto_confirmed_by_rule:
+            return f"Auto-confirmed by rule ({rule.label})" if rule else "Auto-confirmed by rule"
+        if rule is None or rule.autonomy == "suggest_only":
+            return "Suggest-only"
+        if rule.autonomy == "auto_under_threshold":
+            return f"Auto-confirm ≥ {rule.threshold}"
+        return "Auto-confirm"
+
+    def render_expand(s: dict, *, allow_escalate: bool = False):
+        """Inline expand: settlement/invoice diff, owner, comments, audit
+        trail + replay, Undo where applicable — replaces the old separate
+        review panel with an in-place, per-row expansion."""
+        info = enriched.get(s["txn_id"], {})
+        matched_inv = [i for i in invoices if i["invoice_id"] in s["matched_invoice_ids"]]
+
+        st.markdown(because_sentence(s, invoices), unsafe_allow_html=True)
+        if info.get("narration"):
+            st.code(info["narration"], language=None)
+
+        if s["status"] == "matched" and matched_inv:
+            st.markdown("**Show the math**")
+            import re as _re
+            label = s.get("deduction_label")
+            if s["layer"] == "exact_reference+partial_payment" or not label or label == "none":
+                # No deduction formula applies here — a plain match (or a
+                # partial payment, where the invoice's own `amount` is the
+                # full original total, not what this one settlement covers,
+                # so a gross->net breakdown would be arithmetically wrong).
+                note = ("Partial payment — no deduction formula applies; the balance "
+                       "was reduced by the settlement amount directly."
+                       if s["layer"] == "exact_reference+partial_payment"
+                       else "No deduction detected — the settlement amount matched the "
+                            "open balance exactly.")
+                st.code(f"  settlement amount   {info.get('amount', 0):>12,.2f}\n  {note}", language=None)
+            else:
+                gross = sum(mi["amount"] for mi in matched_inv)
+                math_lines = [f"  gross amount        {gross:>12,.2f}"]
+                net = gross
+                m_fee = _re.match(r"gateway_fee\(([\d.]+)%\)\+gst\(([\d.]+)%_on_fee\)", label)
+                m_tds = _re.match(r"tds\((\d+)%\)", label)
+                if m_fee:
+                    fee_rate, gst_rate = float(m_fee.group(1)) / 100, float(m_fee.group(2)) / 100
+                    fee = round(gross * fee_rate, 2)
+                    gst = round(fee * gst_rate, 2)
+                    math_lines.append(f"- fee @ {fee_rate*100:.1f}%       {fee:>12,.2f}")
+                    math_lines.append(f"- GST @ {gst_rate*100:.0f}% on fee   {gst:>12,.2f}")
+                    net = round(gross - fee - gst, 2)
+                elif m_tds:
+                    rate = float(m_tds.group(1)) / 100
+                    tds = round(gross * rate, 2)
+                    math_lines.append(f"- TDS @ {rate*100:.0f}%        {tds:>12,.2f}")
+                    net = round(gross - tds, 2)
+                math_lines.append("=" * 30)
+                math_lines.append(f"  net (expected)      {net:>12,.2f}")
+                math_lines.append(f"  settlement amount   {info.get('amount', net):>12,.2f}")
+                st.code("\n".join(math_lines), language=None)
+
+        if matched_inv:
+            st.markdown("**Settlement vs. invoice**")
+            diff_rows = []
+            for mi in matched_inv:
+                amt_settle = info.get("amount")
+                amt_match = amt_settle is not None and abs(amt_settle - mi["remaining_amount"]) < 0.01
+                diff_rows.append({
+                    "Field": f"amount ({mi['invoice_id']})",
+                    "Settlement": fmt_inr(amt_settle), "Invoice": fmt_inr(mi["amount"]),
+                    "Match": "✓" if amt_match else "diff",
+                })
+                diff_rows.append({
+                    "Field": "date", "Settlement": info.get("txn_date") or "—",
+                    "Invoice": mi["invoice_date"], "Match": "—",
+                })
+                diff_rows.append({
+                    "Field": "reference", "Settlement": info.get("narration", "")[:40],
+                    "Invoice": mi["reference_code"],
+                    "Match": "✓" if mi["reference_code"].upper() in (info.get("narration") or "").upper() else "—",
+                })
+            st.dataframe(pd.DataFrame(diff_rows), width="stretch", hide_index=True)
+
+        oc1, oc2 = st.columns(2)
+        with oc1:
+            new_owner = st.selectbox("Owner", ops.OWNERS,
+                                     index=ops.OWNERS.index(ops.get_owner(DATA_DIR, s["txn_id"]))
+                                     if ops.get_owner(DATA_DIR, s["txn_id"]) in ops.OWNERS else 0,
+                                     key=f"owner_{s['txn_id']}")
+            if new_owner != ops.get_owner(DATA_DIR, s["txn_id"]):
+                ops.set_owner(DATA_DIR, s["txn_id"], new_owner)
+        with oc2:
+            if s["txn_id"] in st.session_state.get("manually_escalated", set()):
+                st.markdown(f"<span class='rp-status-row'><span class='rp-dot rp-dot-red'></span>"
+                           f"Escalated to review queue</span>", unsafe_allow_html=True)
+
+        with st.expander(f"Comments ({len(ops.get_comments(DATA_DIR, s['txn_id']))})"):
+            for c in ops.get_comments(DATA_DIR, s["txn_id"]):
+                st.markdown(f"**{c['author']}**  ·  {c['ts']}  \n{c['text']}")
+            new_comment = st.text_area("Add a comment", key=f"comment_{s['txn_id']}",
+                                       label_visibility="collapsed", placeholder="Add a comment…")
+            if st.button("Post comment", key=f"post_comment_{s['txn_id']}") and new_comment:
+                ops.add_comment(DATA_DIR, s["txn_id"], CURRENT_USER, new_comment)
+                st.rerun()
+
+        with st.expander("Audit trail and replay"):
+            log_entries = entries_for_txn(AUDIT_PATH, s["txn_id"])
+            if log_entries:
+                latest = log_entries[-1]
+                st.json(latest, expanded=False)
+                if st.button("Verify replay", key=f"replay_{s['txn_id']}"):
+                    res = replay_txn(s["txn_id"], INV_CSV, SETTLE_CSV, use_llm=use_llm, logged_entry=latest)
+                    (st.success if res.get("matches") else st.warning)(res["reason"])
+            else:
+                st.caption("No audit entry yet.")
+
+        is_human_confirmed = s["txn_id"] in st.session_state["confirmed"]
+        is_rejected = s["txn_id"] in st.session_state["rejected"]
+        not_ledger_final = is_human_confirmed or is_rejected  # deterministic matches are never undoable here
+        if not_ledger_final and not locked:
+            undo_label = "Undo confirm" if is_human_confirmed else "Undo reject"
+            if st.button(f"{undo_label}", key=f"undo_{s['txn_id']}", icon=":material/undo:"):
+                st.session_state["confirmed"].discard(s["txn_id"])
+                st.session_state["rejected"].discard(s["txn_id"])
+                st.rerun()
+        if is_human_confirmed:
+            if st.button("Post to simulated ERP", key=f"post_{s['txn_id']}", width="stretch"):
+                log_entries = entries_for_txn(AUDIT_PATH, s["txn_id"])
+                ahash = log_entries[-1]["hash"] if log_entries else "unlogged"
+                for inv_id in s["matched_invoice_ids"]:
+                    ops.post_to_erp(DATA_DIR, inv_id, s["txn_id"], info.get("amount", 0), ahash)
+                st.success("Posted — see Settlements → Posted entries.")
+
+        if allow_escalate and not is_rejected:
+            if st.button("Escalate", key=f"escalate_{s['txn_id']}", icon=":material/priority_high:"):
+                st.session_state.setdefault("manually_escalated", set()).add(s["txn_id"])
+                st.toast("Assigned to review queue.", icon=":material/check_circle:")
+
+    def render_row(s: dict, *, tab_key: str, allow_escalate: bool = False):
+        is_animating = s["txn_id"] in confirm_anim_ids
+        row_key = f"row2_{tab_key}_{s['txn_id']}"
+        if is_animating:
+            delay = confirm_anim_ids.index(s["txn_id"]) * motion.STAGGER_MS
+            st.markdown(
+                f"<style>.st-key-{row_key} {{ animation: rp-row-pulse {motion.PULSE_TOTAL_MS}ms "
+                f"ease-out {delay}ms, rp-row-collapse {motion.COLLAPSE_MS}ms ease-out "
+                f"{motion.PULSE_TOTAL_MS + delay}ms forwards; }}</style>", unsafe_allow_html=True)
+
+        with st.container(key=row_key):
+            c1, c2, c3, c4 = st.columns([1.6, 1.6, 1.6, 1.4])
+            info = enriched.get(s["txn_id"], {})
+            with c1:
+                st.markdown(f"**{s['txn_id']}**")
+                if info.get("amount") is not None:
+                    st.markdown(f"<span class='rp-amount' style='font-size:12.5px;color:#6B7280'>"
+                               f"{fmt_inr(info['amount'])}</span>", unsafe_allow_html=True)
+            with c2:
+                if is_animating:
+                    st.markdown(
+                        f'<span class="rp-badge-wrap"><span class="rp-badge-old">{status_row(s["status"])}'
+                        f'</span><span class="rp-badge-new">{status_row("matched")}</span></span>',
+                        unsafe_allow_html=True)
+                else:
+                    st.markdown(confidence_pill(s["confidence"]), unsafe_allow_html=True)
+            with c3:
+                st.markdown(autonomy_badge(autonomy_label_for(s)), unsafe_allow_html=True)
+            with c4:
+                if not is_animating:
+                    if st.button("Details", key=f"toggle_{row_key}", width="stretch", type="tertiary"):
+                        st.session_state.setdefault("expanded_rows", set())
+                        if s["txn_id"] in st.session_state["expanded_rows"]:
+                            st.session_state["expanded_rows"].discard(s["txn_id"])
+                        else:
+                            st.session_state["expanded_rows"].add(s["txn_id"])
+                        st.rerun()
+
+            if not is_animating and s["txn_id"] in st.session_state.get("expanded_rows", set()):
+                with st.container():
+                    render_expand(s, allow_escalate=allow_escalate)
+                    if s["status"] == "pending_confirmation" and tab_key == "pending" and not locked \
+                            and s["txn_id"] not in st.session_state["confirmed"] \
+                            and s["txn_id"] not in st.session_state["rejected"]:
+                        ac1, ac2 = st.columns(2)
+                        if ac1.button("Accept", type="primary", width="stretch", key=f"acc2_{s['txn_id']}"):
+                            start_confirm_animation([s["txn_id"]], {s["txn_id"]: s["layer"]})
+                        if ac2.button("Reject", width="stretch", key=f"rej2_{s['txn_id']}"):
+                            st.session_state["rejected"].add(s["txn_id"])
+                            rules_mod.record_override(DATA_DIR, s["layer"], accepted=False)
+                            st.rerun()
+        st.session_state["seen_txn_ids"].add(s["txn_id"])
+
+    tab_auto, tab_pending, tab_exc, tab_ledger = st.tabs(
+        ["Auto-matched", "Pending confirmation", "Exceptions", "Ledger"])
+
+    with tab_auto:
+        rows = [s for s in settlements if effective_status(s) == "matched" and _layer_ok(s) and _search_ok(s) and _band_ok(s)]
+        st.caption(f"{len(rows)} matched")
+        for s in rows:
+            render_row(s, tab_key="auto")
+        if not rows:
+            st.markdown('<p class="rp-empty">Nothing matched at this filter.</p>', unsafe_allow_html=True)
+
+    with tab_pending:
+        pending_rows = [s for s in settlements
+                       if (effective_status(s) == "pending_confirmation" and _layer_ok(s) and _search_ok(s) and _band_ok(s))
+                       or s["txn_id"] in confirm_anim_ids]
+        st.caption(f"{len(pending_rows)} pending")
+
+        unanimated_pending = [s for s in pending_rows if s["txn_id"] not in confirm_anim_ids]
+        groups = anomaly.group_for_bulk_approval(unanimated_pending)
+        if groups and len(unanimated_pending) > 1:
+            st.markdown("**Grouped approval**")
+            for g in groups[:5]:
+                gc = st.columns([5, 1])
+                gc[0].markdown(f"`{g['layer']}`  ·  {g['deduction_label']} — "
+                              f"{g['count']} items, avg confidence {g['avg_confidence']}")
+                if gc[1].button(f"Approve all {g['count']}",
+                               key=f"bulkapprove2_{g['layer']}_{g['deduction_label']}"):
+                    if locked:
+                        st.error("This run is certified and locked.")
+                    else:
+                        start_confirm_animation(g["txn_ids"], {t: g["layer"] for t in g["txn_ids"]})
+            st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+
+        for s in pending_rows:
+            render_row(s, tab_key="pending")
+        if not pending_rows:
+            st.markdown('<p class="rp-empty">Nothing pending at this filter.</p>', unsafe_allow_html=True)
+
+        if confirm_anim:
+            n = len(confirm_anim_ids)
+            hold_s = (max((n - 1) * motion.STAGGER_MS + motion.PULSE_TOTAL_MS + motion.COLLAPSE_MS, 500) + 150) / 1000
+            time.sleep(hold_s)
+            for t in confirm_anim_ids:
+                st.session_state["confirmed"].add(t)
+                rules_mod.record_override(DATA_DIR, confirm_anim["layer_by_txn"].get(t, "unknown"), accepted=True)
+            st.session_state["confirm_anim"] = None
+            st.rerun()
+
+    with tab_exc:
+        rows = [s for s in settlements if effective_status(s) == "exception" and _layer_ok(s) and _search_ok(s) and _band_ok(s)]
+        st.caption(f"{len(rows)} exceptions")
+        for s in rows:
+            render_row(s, tab_key="exception", allow_escalate=True)
+        if not rows:
+            st.markdown('<p class="rp-empty">No exceptions at this filter.</p>', unsafe_allow_html=True)
+
+    with tab_ledger:
+        inv_rows = [{"Invoice ID": i["invoice_id"], "Customer": i["customer"],
+                    "Invoice date": i["invoice_date"], "Amount": fmt_inr(i["amount"]),
+                    "Remaining": fmt_inr(i["remaining_amount"]), "Status": i["status"],
+                    "Reference code": i["reference_code"]} for i in invoices]
+        st.dataframe(pd.DataFrame(inv_rows), width="stretch", hide_index=True)
+
+    # ---- Activity log drawer, pinned, slides up 200ms ---------------------
+    st.session_state.setdefault("activity_open", False)
+    toggle_label = "Activity log  ▲" if st.session_state["activity_open"] else "Activity log  ▼"
+    if st.button(toggle_label, key="activity_toggle", width="stretch", type="tertiary"):
+        st.session_state["activity_open"] = not st.session_state["activity_open"]
+        st.rerun()
+
+    max_h = "480px" if st.session_state["activity_open"] else "0px"
+    st.markdown(f"<style>.st-key-activity_drawer {{ max-height: {max_h}; }}</style>",
+               unsafe_allow_html=True)
+    with st.container(key="activity_drawer"):
+        st.markdown(
+            '<div class="rp-drawer-row head"><span>Time</span><span>Action</span>'
+            '<span>Layer</span><span>Txn ID</span></div>', unsafe_allow_html=True)
+        log_entries = load_chain(AUDIT_PATH) if os.path.exists(AUDIT_PATH) else []
+        for e in reversed(log_entries[-40:]):
+            st.markdown(
+                f'<div class="rp-drawer-row"><span>{e["ts"][11:19]}</span>'
+                f'<span>{e["output"]["status"]}</span><span>{e["rule_invoked"]}</span>'
+                f'<span class="rp-mono">{e["inputs"].get("txn_id", "—")}</span></div>',
+                unsafe_allow_html=True)
+        if not log_entries:
+            st.markdown('<p class="rp-empty">No activity logged yet.</p>', unsafe_allow_html=True)
+
+elif active_tab == "Settlements":
+    t1, t2, t3 = st.tabs(["Auto-matched", "Invoice ledger", "Posted entries"])
+    with t1:
+        matched = [s for s in settlements if effective_status(s) == "matched"]
+        if matched:
+            rows = [{"Txn ID": s["txn_id"], "Invoices": ", ".join(s["matched_invoice_ids"]),
+                    "Layer": s["layer"], "Deduction": s.get("deduction_label") or "—",
+                    "Confidence": s["confidence"]} for s in matched]
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True,
+                        column_config={"Confidence": st.column_config.ProgressColumn(
+                            "Confidence", min_value=0, max_value=100)})
+        else:
+            st.markdown('<p class="rp-empty">Nothing auto-matched yet.</p>', unsafe_allow_html=True)
+    with t2:
+        inv_rows = [{"Invoice ID": i["invoice_id"], "Customer": i["customer"],
+                    "Invoice date": i["invoice_date"], "Amount": fmt_inr(i["amount"]),
+                    "Remaining": fmt_inr(i["remaining_amount"]), "Status": i["status"],
+                    "Reference code": i["reference_code"]} for i in invoices]
+        st.dataframe(pd.DataFrame(inv_rows), width="stretch", hide_index=True)
+    with t3:
+        posted = ops.load_posted_entries(DATA_DIR)
+        if posted:
+            st.dataframe(pd.DataFrame(posted), width="stretch", hide_index=True)
+        else:
+            st.markdown('<p class="rp-empty">No simulated ERP postings yet.</p>', unsafe_allow_html=True)
+
+# ==========================================================================
+# REPORTS
+# ==========================================================================
+elif active_tab == "Model diagnostics":
+    import evaluate as _eval
+
+    gt = None
+    if os.path.exists(GT_CSV):
+        from recon_agent.matcher import load_ground_truth
+        gt = load_ground_truth(GT_CSV)
+
+    # ---- (a) precision vs. auto-approval-rate, draggable threshold --------
+    st.markdown("**Precision vs. auto-approval rate**")
+    st.caption("Sweeps the Tier-1 investigator's confidence threshold; the slider is the "
+              "draggable marker — KPIs below recompute live as you move it.")
+    if gt:
+        curve = rules_mod.threshold_sweep(settlements, gt)
+        if any(c["n"] > 0 for c in curve):
+            cdf = pd.DataFrame(curve).set_index("tau")
+            st.line_chart(cdf[["coverage", "precision"]], color=["#0D94FB", "#16A34A"])
+            tau_pick = st.slider("Confidence threshold", 0, 100, 85, step=5, key="diag_tau")
+            row = min(curve, key=lambda r: abs(r["tau"] - tau_pick))
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Auto-approval rate @ this threshold", f"{row['coverage']*100:.1f}%")
+            c2.metric("Precision @ this threshold", f"{row['precision']*100:.1f}%")
+            c3.metric("n accepted", row["n"])
+        else:
+            st.markdown('<p class="rp-empty">Not enough L5 volume in this batch to chart a curve.</p>',
+                       unsafe_allow_html=True)
+    else:
+        st.markdown('<p class="rp-empty">No ground truth file for this batch.</p>', unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+
+    # ---- (b) per-layer ablation, pulled from evaluate.py -------------------
+    st.markdown("**Per-layer ablation**")
+    st.caption("Each layer disabled in turn, on this exact batch — a real rerun via evaluate.py, "
+              "not a canned chart.")
+    if st.button("Run ablation on this batch", key="diag_run_ablation"):
+        with st.spinner("Reconciling with each layer disabled in turn…"):
+            st.session_state["diag_ablation"] = _eval.ablation(DATA_DIR, use_llm=use_llm)
+    if st.session_state.get("diag_ablation"):
+        abl = st.session_state["diag_ablation"]
+        abl_df = pd.DataFrame({"auto_match_rate": {k: v["auto_match_rate"] for k, v in abl.items()}})
+        st.bar_chart(abl_df, color="#0D94FB")
+        st.dataframe(pd.DataFrame([
+            {"Configuration": k, "Auto-match rate": v["auto_match_rate"],
+            "Precision": v.get("precision"), "Recall": v.get("recall")}
+            for k, v in abl.items()
+        ]), width="stretch", hide_index=True)
+    else:
+        st.markdown('<p class="rp-empty">Not run yet this session.</p>', unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+
+    # ---- (c) mean +/- std across 5 seeds -----------------------------------
+    st.markdown("**Mean ± std across 5 seeds**")
+    st.caption("The demo batch alone is one seed — this reruns the full pipeline on 5 freshly "
+              "generated seeds at the current batch size so the headline numbers aren't read "
+              "off a single lucky (or unlucky) run.")
+    if st.button("Run 5-seed evaluation", key="diag_run_multiseed"):
+        import tempfile
+        with st.spinner("Generating and reconciling 5 seeds…"):
+            n_settlements_guess = metrics["total_settlements"]
+            with tempfile.TemporaryDirectory(prefix="recon_diag_") as scratch_dir:
+                st.session_state["diag_multiseed"] = _eval.multi_seed(
+                    scratch_dir, [101, 102, 103, 104, 105], n_settlements_guess, use_llm=use_llm)
+    if st.session_state.get("diag_multiseed"):
+        ms = st.session_state["diag_multiseed"]
+        mcols = st.columns(4)
+        for col, key, label in zip(mcols,
+                                   ["auto_match_rate", "precision", "recall", "deduction_hypothesis_accuracy"],
+                                   ["Auto-match rate", "Precision", "Recall", "Deduction accuracy"]):
+            v = ms[key]
+            col.metric(label, f"{v['mean']*100:.1f}%" if v["mean"] is not None else "n/a",
+                      delta=f"± {v['std']*100:.1f}pp" if v["std"] is not None else None,
+                      delta_color="off")
+        st.caption(f"Honeypots across these 5 seeds: {ms['honeypots']['baited']} of "
+                  f"{ms['honeypots']['total']} baited.")
+    else:
+        st.markdown('<p class="rp-empty">Not run yet this session.</p>', unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+
+    # ---- (item 9) honeypots ------------------------------------------------
+    st.markdown("**Honeypots**")
+    hp_path = os.path.join(DATA_DIR, "honeypots.csv")
+    if os.path.exists(hp_path):
+        honeypot_ids = _eval.load_honeypots(hp_path)
+        results_by_txn = {s["txn_id"]: s for s in settlements}
+        baited = [t for t in honeypot_ids
+                 if results_by_txn.get(t, {}).get("status") in ("matched", "pending_confirmation")
+                 and results_by_txn[t]["matched_invoice_ids"]]
+        declined = honeypot_ids - set(baited)
+        c1, c2 = st.columns(2)
+        c1.metric("Baited (agent wrongly matched)", f"{len(baited)} of {len(honeypot_ids)}")
+        c2.metric("Correctly declined", f"{len(declined)} of {len(honeypot_ids)}")
+        if baited:
+            st.warning("These adversarial credits (same amount as a real invoice, different "
+                      "counterparty, no reference code) were wrongly matched. Every one baited "
+                      "here cleared the confidence bar on amount+date closeness alone, with no "
+                      "genuine reference-text corroboration — a real gap in the rule-based "
+                      "fallback's confidence scoring, not fixed as part of this diagnostics view.")
+            for t in baited:
+                s = results_by_txn[t]
+                st.markdown(f"- `{t}` → wrongly matched to {', '.join(s['matched_invoice_ids'])} "
+                          f"(confidence {s['confidence']}, layer `{s['layer']}`)")
+        if declined:
+            with st.expander(f"Correctly declined ({len(declined)})"):
+                for t in declined:
+                    st.markdown(f"- `{t}`")
+    else:
+        st.markdown('<p class="rp-empty">No honeypots.csv for this batch — regenerate to get one '
+                  '(added after this batch was first generated).</p>', unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+
+    # ---- (item 10) verify determinism --------------------------------------
+    st.markdown("**Verify determinism**")
+    st.caption("Reruns this exact batch N times on identical input and reports the fraction of "
+              "decisions that landed the same way every time (DecDet) — the audit-replay story, "
+              "made clickable.")
+    reps = st.slider("Reruns", 2, 10, 5, key="diag_decdet_reps")
+    if st.button("Verify determinism", key="diag_run_decdet"):
+        with st.spinner(f"Rerunning {reps} times…"):
+            st.session_state["diag_decdet"] = _eval.decision_determinism(DATA_DIR, use_llm=use_llm, reps=reps)
+    if st.session_state.get("diag_decdet") is not None:
+        val = st.session_state["diag_decdet"]
+        (st.success if val >= 0.95 else st.warning)(
+            f"DecDet: {val*100:.1f}% of decisions were identical across {reps} reruns."
+            + ("" if not use_llm else " (a live LLM call is not seeded, so <100% here reflects "
+                                      "the model's own consistency, not a bug.)"))
+
+elif active_tab == "Reports":
+    gt = None
+    if os.path.exists(GT_CSV):
+        from recon_agent.matcher import load_ground_truth
+        gt = load_ground_truth(GT_CSV)
+
+    st.markdown("**Rule preview**")
+    st.caption("Backtest a rule's current autonomy setting against hidden ground truth before trusting it.")
+    if gt:
+        for layer, rule in rules.items():
+            if not rule.tunable:
+                continue
+            rc1, rc2 = st.columns([4, 1])
+            rc1.markdown(f"**{rule.label}** — autonomy: `{rule.autonomy}`"
+                        f"{f' at confidence ≥ {rule.threshold}' if rule.autonomy=='auto_under_threshold' else ''}")
+            show_dryrun = rc2.button("Preview", key=f"dryrun_{layer}", width="stretch")
+            if show_dryrun:
+                st.session_state[f"dryrun_shown_{layer}"] = True
+                st.session_state[f"dryrun_animate_{layer}"] = True
+            if st.session_state.get(f"dryrun_shown_{layer}"):
+                dr = rules_mod.dry_run(rule, settlements, gt)
+                # ---- #7: would-match/would-mismatch/would-auto-close count up together ----
+                if st.session_state.get(f"dryrun_animate_{layer}"):
+                    motion.count_up_grid([
+                        {"label": "Candidates", "value": dr["candidates"], "decimals": 0},
+                        {"label": "Would auto-close", "value": dr["would_auto_close"], "decimals": 0},
+                        {"label": "Would match", "value": dr["would_match"], "decimals": 0},
+                        {"label": "Would mis-match", "value": dr["would_mismatch"], "decimals": 0},
+                    ])
+                    st.session_state[f"dryrun_animate_{layer}"] = False
+                else:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Candidates", dr["candidates"])
+                    c2.metric("Would auto-close", dr["would_auto_close"])
+                    c3.metric("Would match", dr["would_match"])
+                    c4.metric("Would mis-match", dr["would_mismatch"])
+                if dr["would_be_precision"] is not None:
+                    st.caption(f"Backtested precision if live: {dr['would_be_precision']*100:.1f}%")
+    else:
+        st.markdown('<p class="rp-empty">No ground truth file for this batch.</p>', unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    st.markdown("**Confidence threshold — coverage and precision**")
+    if gt:
+        curve = rules_mod.threshold_sweep(settlements, gt)
+        cdf = pd.DataFrame(curve).set_index("tau")
+        st.line_chart(cdf[["coverage", "precision"]], color=["#0D94FB", "#16A34A"])
+        tau_pick = st.slider("Confidence threshold", 0, 100, 85, step=5)
+        row = min(curve, key=lambda r: abs(r["tau"] - tau_pick))
+        st.caption(f"At {row['tau']}: coverage {row['coverage']*100:.1f}%, "
+                  f"precision {row['precision']*100:.1f}%, n={row['n']}")
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    st.markdown("**Rule effectiveness**")
+    stats = rules_mod.load_rule_stats(DATA_DIR)
+    if stats:
+        rows = [{"Layer": k, "Accepted": v["accepted"], "Overridden": v["overridden"],
+                "Accept streak": v["streak"]} for k, v in stats.items()]
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        for layer in rules_mod.promotion_candidates(DATA_DIR, rules):
+            st.success(f"`{layer}` has {rules_mod.PROMOTION_STREAK}+ consecutive accepted suggestions "
+                      f"with zero overrides — consider promoting its autonomy in Settings.")
+    else:
+        st.markdown('<p class="rp-empty">No confirm/reject actions recorded yet.</p>', unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    st.markdown("**Audit log**")
+    if os.path.exists(AUDIT_PATH):
+        ok, msg = verify_chain(AUDIT_PATH)
+        (st.success if ok else st.error)(f"Hash chain: {msg}")
+    if st.button("Build audit export"):
+        data = ops.build_audit_package(DATA_DIR, AUDIT_PATH)
+        st.download_button("Download audit_package.zip", data,
+                           file_name="audit_package.zip", mime="application/zip")
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    st.markdown("**Export**")
+    full_rows = [{"Txn ID": s["txn_id"], "Invoices": ", ".join(s["matched_invoice_ids"]),
+                 "Status": effective_status(s), "Confidence": s["confidence"], "Layer": s["layer"],
+                 "Deduction": s.get("deduction_label") or "—", "Rationale": s["rationale"]}
+                for s in settlements]
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        st.download_button("Download full reconciliation report (CSV)",
+                           pd.DataFrame(full_rows).to_csv(index=False),
+                           file_name="reconciliation_report.csv", mime="text/csv")
+    with ec2:
+        if os.path.exists(AUDIT_PATH):
+            with open(AUDIT_PATH, "rb") as f:
+                st.download_button("Download audit log (JSONL)", f.read(),
+                                  file_name="audit_log.jsonl", mime="application/x-ndjson")
+        else:
+            st.caption("No audit log yet for this run.")
+    with st.expander("Raw metrics (JSON)"):
+        st.json(metrics)
+
+# ==========================================================================
+# SETTINGS
+# ==========================================================================
+elif active_tab == "Settings":
+    st.markdown("**Approval chain**")
+    cert = ops.get_certification(DATA_DIR, run_id)
+    if cert:
+        st.caption(f"Prepared by {cert['prepared_by']} at {cert['prepared_at']}")
+        if cert["certified"]:
+            st.markdown(f"<span class='rp-status-row'>{icon('lock', 14)}&nbsp;Certified by "
+                       f"{cert['reviewed_by']} at {cert['reviewed_at']} — this run is locked.</span>",
+                       unsafe_allow_html=True)
+        else:
+            reviewer = st.selectbox("Reviewer (must differ from preparer)",
+                                    [o for o in ops.OWNERS if o != "Unassigned"])
+            if st.button("Certify this run", type="primary"):
+                res = ops.certify_run(DATA_DIR, run_id, reviewer)
+                (st.success if res["ok"] else st.error)(res.get("reason", "Certified."))
+                if res["ok"]:
+                    st.rerun()
+    else:
+        st.markdown('<p class="rp-empty">Run reconciliation to start a certification chain.</p>',
+                   unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    st.markdown("**Autonomy per rule**")
+    st.dataframe(pd.DataFrame([{"Layer": r.layer, "Label": r.label, "Autonomy": r.autonomy,
+                               "Threshold": r.threshold if r.autonomy == "auto_under_threshold" else "—",
+                               "Tunable": r.tunable} for r in rules.values()]),
+                width="stretch", hide_index=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    st.markdown("**Saved views**")
+    views = ops.list_saved_views(DATA_DIR)
+    if views:
+        for name in list(views.keys()):
+            vc = st.columns([4, 1])
+            vc[0].write(f"**{name}**: {views[name]}")
+            if vc[1].button("Delete", key=f"destructive_delview_{name}"):
+                ops.delete_view(DATA_DIR, name)
+                st.rerun()
+    else:
+        st.markdown('<p class="rp-empty">No saved views yet.</p>', unsafe_allow_html=True)
+
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    st.markdown("**Motion and platform-limit scope notes**")
+    st.caption(
+        "Every animation in this console (see recon_agent/motion.py) is built to communicate "
+        "a state change, respects prefers-reduced-motion, and stays under 400ms except the two "
+        "the spec itself defines longer: the confirm pulse-and-collapse (500ms + 200ms) and the "
+        "pipeline ticker (capped at 2.5s). Two things stay out of reach of a Python-only "
+        "Streamlit app regardless: a global keyboard-shortcut layer and a true OS-level command "
+        "palette overlay both need a custom bidirectional JS component; what's shipped instead "
+        "is Prev/Next controls and a button-triggered command-search popover."
+    )

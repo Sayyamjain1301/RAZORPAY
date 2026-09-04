@@ -1,0 +1,324 @@
+"""
+Synthetic data generator for the Payment Reconciliation Agent.
+
+Generates two datasets that mimic a real merchant finance-ops loop:
+
+  1. invoices.csv    - the merchant's internal "books" (open receivables)
+  2. settlements.csv - incoming bank / payment-gateway settlement transactions,
+                        deliberately messy the way real settlement files are:
+                        garbled reference text, platform-fee deductions,
+                        batched payouts covering multiple invoices, and
+                        partial payments.
+
+A ground_truth.csv is also written (invoice_id -> settlement txn_id(s)) so we
+can score the agent's match rate, precision and recall objectively. The agent
+itself is never shown this file - it's only used by evaluate.py / the
+dashboard to report accuracy.
+
+Run:  python data_gen.py [--n 60] [--seed 42]
+"""
+
+import argparse
+import csv
+import os
+import random
+import string
+from datetime import date, timedelta
+
+CUSTOMERS = [
+    "Aarav Traders", "Bhoomi Textiles", "Chetan Foods Pvt Ltd", "Devika Retail",
+    "Everest Logistics", "Falcon Electronics", "Ganga Agro Exports", "Harish Motors",
+    "Indira Apparel Co", "Jyoti Pharmaceuticals", "Kaveri Furnishings", "Lakshya Sports",
+    "Meridian Hardware", "Nakshatra Jewellers", "Orion Packaging", "Prithvi Organics",
+    "Quantum Componentz", "Ridhima Cosmetics", "Suryansh Steel", "Trivedi Books",
+    "Utkarsh Cables", "Vasundhara Ceramics", "Wave Beverages", "Xanadu Interiors",
+    "Yashvi Toys", "Zenith Chemicals",
+]
+
+GATEWAY_FEE_RATES = [0.018, 0.02, 0.023, 0.025, 0.03]  # razorpay-style gateway fee %
+GST_ON_FEE = 0.18  # GST is charged on the fee itself, not the invoice amount
+TDS_RATES = [0.01, 0.02, 0.10]  # sec 194 style TDS deductions on B2B invoices
+
+
+def pick_deduction(rng: random.Random):
+    """Return (total_deduction_rate, deduction_label) applied to an invoice amount.
+
+    Mirrors real Indian settlement math: either a straight gateway fee plus
+    18% GST *on that fee* (not on the invoice), a TDS deduction, or nothing.
+    The agent is only ever shown the resulting paid amount - it has to
+    reconstruct which formula (if any) explains the variance.
+    """
+    kind = rng.choices(["none", "fee_gst", "tds"], weights=[0.25, 0.55, 0.20])[0]
+    if kind == "none":
+        return 0.0, "none"
+    if kind == "fee_gst":
+        fee_rate = rng.choice(GATEWAY_FEE_RATES)
+        total_rate = round(fee_rate * (1 + GST_ON_FEE), 5)
+        return total_rate, f"gateway_fee({fee_rate*100:.1f}%)+gst(18%_on_fee)"
+    tds_rate = rng.choice(TDS_RATES)
+    return tds_rate, f"tds({tds_rate*100:.0f}%)"
+
+
+def ref_code(i: int) -> str:
+    return f"RJPY{2000 + i}"
+
+
+def garble(code: str, rng: random.Random) -> str:
+    """Corrupt a reference code the way OCR/bank-narration truncation does."""
+    kind = rng.choice(["truncate", "case", "typo", "spacing", "prefix_noise"])
+    if kind == "truncate":
+        return code[: rng.randint(len(code) - 2, len(code) - 1)]
+    if kind == "case":
+        return code.lower()
+    if kind == "typo":
+        pos = rng.randrange(len(code))
+        chars = list(code)
+        chars[pos] = rng.choice(string.digits)
+        return "".join(chars)
+    if kind == "spacing":
+        pos = len(code) // 2
+        return code[:pos] + " " + code[pos:]
+    return f"XX{rng.randint(10,99)}-{code}"
+
+
+def narration_for(codes, customer, rng, drop_ref=False):
+    templates = [
+        "NEFT/{code}/{cust}",
+        "IMPS-{code}-{custshort}",
+        "UPI/{code}/{custshort}/payment",
+        "RTGS {code} {cust}",
+        "Settlement batch {code}",
+        "{cust} payment ref {code}",
+    ]
+    custshort = customer.split()[0].upper()
+    if drop_ref:
+        return rng.choice([
+            f"NEFT credit {custshort}",
+            f"IMPS/{custshort}/payment received",
+            "Bulk settlement credit",
+        ])
+    code_str = " + ".join(codes)
+    t = rng.choice(templates)
+    return t.format(code=code_str, cust=customer, custshort=custshort)
+
+
+def generate(n_invoices: int, seed: int, out_dir: str):
+    rng = random.Random(seed)
+    os.makedirs(out_dir, exist_ok=True)
+
+    start = date(2026, 8, 1)
+    invoices = []
+    for i in range(n_invoices):
+        inv_date = start + timedelta(days=rng.randint(0, 20))
+        amount = round(rng.uniform(1500, 85000), 2)
+        invoices.append({
+            "invoice_id": f"INV{1000+i}",
+            "customer": rng.choice(CUSTOMERS),
+            "invoice_date": inv_date.isoformat(),
+            "amount": amount,
+            "reference_code": ref_code(i),
+        })
+
+    settlements = []
+    ground_truth = {}  # invoice_id -> [txn_id, ...]
+    deduction_truth = []  # (txn_id, deduction_rate, deduction_label) - hidden from the agent, scoring only
+    txn_counter = 0
+
+    def new_txn_id():
+        nonlocal txn_counter
+        txn_counter += 1
+        return f"TXN{5000+txn_counter}"
+
+    i = 0
+    while i < len(invoices):
+        inv = invoices[i]
+        roll = rng.random()
+
+        # ~8% genuinely unpaid invoice: no settlement at all. Agent must NOT
+        # invent a match for these.
+        if roll < 0.08:
+            ground_truth[inv["invoice_id"]] = []
+            i += 1
+            continue
+
+        # ~10% batched settlement covering this + next 1-2 invoices together
+        if roll < 0.18 and i + 1 < len(invoices):
+            batch_size = 2 if (roll < 0.15 or i + 2 >= len(invoices)) else 3
+            batch = invoices[i:i + batch_size]
+            total = round(sum(b["amount"] for b in batch), 2)
+            ded_rate, ded_label = pick_deduction(rng)
+            paid = round(total * (1 - ded_rate), 2)
+            settle_date = date.fromisoformat(batch[-1]["invoice_date"]) + timedelta(days=rng.randint(1, 4))
+            codes = [b["reference_code"] for b in batch]
+            if rng.random() < 0.3:
+                codes = [garble(c, rng) for c in codes]
+            txn_id = new_txn_id()
+            settlements.append({
+                "txn_id": txn_id,
+                "txn_date": settle_date.isoformat(),
+                "amount": paid,
+                "narration": narration_for(codes, batch[0]["customer"], rng),
+            })
+            deduction_truth.append((txn_id, ded_rate, ded_label))
+            for b in batch:
+                ground_truth[b["invoice_id"]] = [txn_id]
+            i += batch_size
+            continue
+
+        # ~10% partial payment: 2 settlements close one invoice
+        if roll < 0.28:
+            split = round(inv["amount"] * rng.uniform(0.3, 0.6), 2)
+            remainder = round(inv["amount"] - split, 2)
+            txns_for_inv = []
+            for part_amount, delay in [(split, rng.randint(1, 3)), (remainder, rng.randint(4, 9))]:
+                settle_date = date.fromisoformat(inv["invoice_date"]) + timedelta(days=delay)
+                code = inv["reference_code"]
+                if rng.random() < 0.25:
+                    code = garble(code, rng)
+                txn_id = new_txn_id()
+                settlements.append({
+                    "txn_id": txn_id,
+                    "txn_date": settle_date.isoformat(),
+                    "amount": part_amount,
+                    "narration": narration_for([code], inv["customer"], rng),
+                })
+                deduction_truth.append((txn_id, 0.0, "none"))
+                txns_for_inv.append(txn_id)
+            ground_truth[inv["invoice_id"]] = txns_for_inv
+            i += 1
+            continue
+
+        # ~12% garbled reference code, needs fuzzy matching
+        if roll < 0.40:
+            ded_rate, ded_label = pick_deduction(rng)
+            paid = round(inv["amount"] * (1 - ded_rate), 2)
+            settle_date = date.fromisoformat(inv["invoice_date"]) + timedelta(days=rng.randint(1, 5))
+            code = garble(inv["reference_code"], rng)
+            txn_id = new_txn_id()
+            settlements.append({
+                "txn_id": txn_id,
+                "txn_date": settle_date.isoformat(),
+                "amount": paid,
+                "narration": narration_for([code], inv["customer"], rng),
+            })
+            deduction_truth.append((txn_id, ded_rate, ded_label))
+            ground_truth[inv["invoice_id"]] = [txn_id]
+            i += 1
+            continue
+
+        # ~7% reference dropped entirely, must match on amount+date+name
+        if roll < 0.47:
+            ded_rate, ded_label = pick_deduction(rng)
+            paid = round(inv["amount"] * (1 - ded_rate), 2)
+            settle_date = date.fromisoformat(inv["invoice_date"]) + timedelta(days=rng.randint(1, 5))
+            txn_id = new_txn_id()
+            settlements.append({
+                "txn_id": txn_id,
+                "txn_date": settle_date.isoformat(),
+                "amount": paid,
+                "narration": narration_for([], inv["customer"], rng, drop_ref=True),
+            })
+            deduction_truth.append((txn_id, ded_rate, ded_label))
+            ground_truth[inv["invoice_id"]] = [txn_id]
+            i += 1
+            continue
+
+        # remaining ~53%: clean exact match, sometimes with a fee/GST/TDS deduction
+        ded_rate, ded_label = pick_deduction(rng)
+        paid = round(inv["amount"] * (1 - ded_rate), 2)
+        settle_date = date.fromisoformat(inv["invoice_date"]) + timedelta(days=rng.randint(1, 4))
+        txn_id = new_txn_id()
+        settlements.append({
+            "txn_id": txn_id,
+            "txn_date": settle_date.isoformat(),
+            "amount": paid,
+            "narration": narration_for([inv["reference_code"]], inv["customer"], rng),
+        })
+        deduction_truth.append((txn_id, ded_rate, ded_label))
+        ground_truth[inv["invoice_id"]] = [txn_id]
+        i += 1
+
+    # ~5 unexplained credits: settlements with no invoice at all (agent must flag, not force-match)
+    for _ in range(max(2, n_invoices // 12)):
+        settle_date = start + timedelta(days=rng.randint(0, 25))
+        txn_id = new_txn_id()
+        settlements.append({
+            "txn_id": txn_id,
+            "txn_date": settle_date.isoformat(),
+            "amount": round(rng.uniform(500, 5000), 2),
+            "narration": rng.choice([
+                "Misc credit adjustment", "Refund reversal", "NEFT credit - unidentified",
+            ]),
+        })
+        deduction_truth.append((txn_id, 0.0, "none"))
+
+    # ---- honeypots: adversarial, plausibly-but-wrongly matchable credits --
+    # Same amount and settlement date as a REAL invoice, but for a different
+    # counterparty and with no reference code at all -- engineered to tempt
+    # the amount/date-driven subset-sum layer or the investigator into a
+    # false match. Hidden from the agent; only evaluate.py / the dashboard's
+    # honeypot panel ever reads honeypots.csv, and only to report bait-taken.
+    honeypots = []
+    n_honeypots = max(1, n_invoices // 20)
+    bait_pool = [inv for inv in invoices if inv["invoice_id"] not in ground_truth
+                or ground_truth[inv["invoice_id"]]]  # only invoices that DID get a real settlement
+    for inv in rng.sample(bait_pool, min(n_honeypots, len(bait_pool))):
+        other_customers = [c for c in CUSTOMERS if c != inv["customer"]]
+        settle_date = date.fromisoformat(inv["invoice_date"]) + timedelta(days=rng.randint(1, 4))
+        txn_id = new_txn_id()
+        settlements.append({
+            "txn_id": txn_id,
+            "txn_date": settle_date.isoformat(),
+            "amount": inv["amount"],  # exact amount echo -- the bait
+            "narration": f"NEFT credit {rng.choice(other_customers).split()[0].upper()}",
+        })
+        deduction_truth.append((txn_id, 0.0, "none"))
+        honeypots.append(txn_id)
+        # deliberately NOT added to ground_truth -- correct behavior is to
+        # leave it as an unexplained credit, never match it to `inv`
+
+    rng.shuffle(settlements)
+
+    with open(os.path.join(out_dir, "invoices.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["invoice_id", "customer", "invoice_date", "amount", "reference_code"])
+        w.writeheader()
+        w.writerows(invoices)
+
+    with open(os.path.join(out_dir, "settlements.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["txn_id", "txn_date", "amount", "narration"])
+        w.writeheader()
+        w.writerows(settlements)
+
+    with open(os.path.join(out_dir, "ground_truth.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["invoice_id", "settlement_txn_ids"])
+        for inv_id, txns in ground_truth.items():
+            w.writerow([inv_id, "|".join(txns)])
+
+    # Hidden from the agent - used only by the dashboard/evaluator to score how
+    # well the deduction-hypothesis engine explained each variance.
+    with open(os.path.join(out_dir, "deduction_truth.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["txn_id", "deduction_rate", "deduction_label"])
+        for txn_id, ded_rate, ded_label in deduction_truth:
+            w.writerow([txn_id, ded_rate, ded_label])
+
+    # Hidden from the agent - adversarial bait txn_ids, for the honeypot
+    # panel / evaluate.py to report how many the agent (correctly) declined.
+    with open(os.path.join(out_dir, "honeypots.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["txn_id"])
+        for txn_id in honeypots:
+            w.writerow([txn_id])
+
+    print(f"Generated {len(invoices)} invoices and {len(settlements)} settlement transactions "
+         f"({len(honeypots)} honeypots) -> {out_dir}/")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n", type=int, default=60, help="number of invoices to generate")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out", type=str, default=os.path.join(os.path.dirname(__file__), "data"))
+    args = parser.parse_args()
+    generate(args.n, args.seed, args.out)

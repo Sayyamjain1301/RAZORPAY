@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+data/*.csv
+data/*.jsonl
+eval_out/
+.streamlit/secrets.toml
+.DS_Store
+.mypy_cache/
+.pytest_cache/
+_v2_backup/
