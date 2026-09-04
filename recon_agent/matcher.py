@@ -328,7 +328,7 @@ def try_subset_sum(open_invoices: list[dict], settlement: dict,
 
 def _result(txn_id, status, layer, invoice_ids, confidence, rationale,
             deduction_rate=None, deduction_label=None, source="deterministic",
-            input_tokens=0, output_tokens=0):
+            input_tokens=0, output_tokens=0, llm_attempts=0, llm_path="n/a"):
     return {
         "txn_id": txn_id,
         "status": status,  # "matched" | "pending_confirmation" | "exception"
@@ -341,6 +341,8 @@ def _result(txn_id, status, layer, invoice_ids, confidence, rationale,
         "source": source,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "llm_attempts": llm_attempts,   # item 4: visible in the audit log
+        "llm_path": llm_path,           # succeeded_first_try / retried_then_succeeded / ...
     }
 
 
@@ -348,12 +350,16 @@ ALL_LAYERS = frozenset({"L1", "L2", "L3", "L4", "L5"})
 
 
 def reconcile(invoices: list[dict], settlements: list[dict], use_llm: bool = True,
-             enabled_layers: frozenset[str] = ALL_LAYERS) -> list[dict]:
+             enabled_layers: frozenset[str] = ALL_LAYERS, on_llm_retry=None) -> list[dict]:
     """`enabled_layers` is an ablation knob for evaluate.py only — the default
     (every layer on) is byte-identical to this function's original behavior;
     it never changes what a normal run does. L1=exact reference match,
     L2=deduction-formula fitting, L3=anchored batch/subset-sum, L4=partial
-    payment, L5=Tier-1 investigator."""
+    payment, L5=Tier-1 investigator.
+
+    `on_llm_retry` is optional (default None -- no behavior change) and is
+    passed straight through to llm_reasoner.investigate() so app.py can
+    surface "retrying (attempt 2/3)..." in the UI (item 4)."""
     results = []
 
     for settlement in settlements:
@@ -451,7 +457,7 @@ def reconcile(invoices: list[dict], settlements: list[dict], use_llm: bool = Tru
         # --- Layer 5: Tier-1 Exception Investigator (bounded, read-only, proposal only) ---
         if result is None and "L5" in enabled_layers:
             candidates = build_fuzzy_candidates(open_invoices, settlement)
-            inv_result = investigate(settlement, candidates, use_llm=use_llm)
+            inv_result = investigate(settlement, candidates, use_llm=use_llm, on_retry=on_llm_retry)
             if inv_result.chosen_invoice_ids:
                 # item 5: a proposal can now be a batch (>1 invoice_id), not
                 # just the single top candidate -- surfaced with one combined
@@ -461,12 +467,14 @@ def reconcile(invoices: list[dict], settlements: list[dict], use_llm: bool = Tru
                     list(inv_result.chosen_invoice_ids), inv_result.confidence,
                     inv_result.rationale, source=inv_result.source,
                     input_tokens=inv_result.input_tokens, output_tokens=inv_result.output_tokens,
+                    llm_attempts=inv_result.attempts, llm_path=inv_result.llm_path,
                 )
             else:
                 result = _result(
                     settlement["txn_id"], "exception", "llm_investigator",
                     [], inv_result.confidence, inv_result.rationale, source=inv_result.source,
                     input_tokens=inv_result.input_tokens, output_tokens=inv_result.output_tokens,
+                    llm_attempts=inv_result.attempts, llm_path=inv_result.llm_path,
                 )
         elif result is None:
             # L5 disabled for this ablation run and nothing upstream resolved
@@ -555,10 +563,10 @@ def compute_metrics(results: list[dict], ground_truth: Optional[dict] = None,
 def run_reconciliation(invoices_csv: str, settlements_csv: str,
                         ground_truth_csv: Optional[str] = None,
                         deduction_truth_csv: Optional[str] = None,
-                        use_llm: bool = True) -> dict:
+                        use_llm: bool = True, on_llm_retry=None) -> dict:
     invoices = load_invoices(invoices_csv)
     settlements = load_settlements(settlements_csv)
-    results = reconcile(invoices, settlements, use_llm=use_llm)
+    results = reconcile(invoices, settlements, use_llm=use_llm, on_llm_retry=on_llm_retry)
 
     ground_truth = load_ground_truth(ground_truth_csv) if ground_truth_csv else None
     deduction_truth = load_deduction_truth(deduction_truth_csv) if deduction_truth_csv else None

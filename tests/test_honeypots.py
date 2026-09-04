@@ -53,3 +53,43 @@ def test_deterministic_layers_never_take_the_bait():
     results = reconcile(invoices, settlements, use_llm=False)
     bait_result = next(r for r in results if r["txn_id"] == "BAIT")
     assert not bait_result["matched_invoice_ids"]  # INV1 already closed, nothing left to wrongly match
+
+
+def test_forced_scenario_guarantees_batched_settlement(tmp_path):
+    """item 7: requesting a scenario type guarantees it appears, even on a
+    seed that might not have produced one naturally."""
+    from data_gen import generate
+    import csv
+
+    generate(20, 999, str(tmp_path), force_scenarios={"batched_settlement"})
+    with open(tmp_path / "ground_truth.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    # a batched settlement covers >=2 invoices under one settlement_txn_id
+    txn_to_invoices: dict[str, int] = {}
+    for row in rows:
+        for txn in filter(None, row["settlement_txn_ids"].split("|")):
+            txn_to_invoices[txn] = txn_to_invoices.get(txn, 0) + 1
+    assert any(count >= 2 for count in txn_to_invoices.values()), \
+        "expected at least one settlement covering 2+ invoices (a batch)"
+
+
+def test_forced_scenario_guarantees_partial_payment(tmp_path):
+    from data_gen import generate
+    import csv
+
+    generate(20, 999, str(tmp_path), force_scenarios={"partial_payment"})
+    with open(tmp_path / "ground_truth.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    # a partial payment splits one invoice across 2 settlement txns
+    assert any(len(row["settlement_txn_ids"].split("|")) >= 2 for row in rows if row["settlement_txn_ids"])
+
+
+def test_no_force_scenarios_reproduces_default_output(tmp_path):
+    """The additive parameter must not change output when unused."""
+    from data_gen import generate
+
+    d1, d2 = tmp_path / "a", tmp_path / "b"
+    generate(30, 42, str(d1))
+    generate(30, 42, str(d2), force_scenarios=None)
+    assert (d1 / "invoices.csv").read_text() == (d2 / "invoices.csv").read_text()
+    assert (d1 / "settlements.csv").read_text() == (d2 / "settlements.csv").read_text()

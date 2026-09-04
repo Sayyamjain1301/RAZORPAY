@@ -59,6 +59,11 @@ class AuditLog:
             "action": f"invoices {settlement['matched_invoice_ids']} updated"
                       if settlement["status"] == "matched" else "none — proposal or exception only",
             "review": {"by": None, "at": None},
+            # item 4: which of the possible LLM-call paths this decision took
+            # -- "the model was flaky but recovered" is now visible in the
+            # audit trail, not silently collapsed into one fallback label.
+            "llm_attempts": settlement.get("llm_attempts", 0),
+            "llm_path": settlement.get("llm_path", "n/a"),
         }
         entry["prev_hash"] = self.prev_hash
         entry["hash"] = _hash(entry)

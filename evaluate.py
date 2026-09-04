@@ -201,7 +201,7 @@ def main():
     ap.add_argument("--demo-n", type=int, default=60)
     ap.add_argument("--demo-seed", type=int, default=42)
     ap.add_argument("--use-llm", action="store_true",
-                    help="Use a live Claude call for L5 (needs ANTHROPIC_API_KEY). "
+                    help="Use a live Gemini call for L5 (needs GEMINI_API_KEY). "
                          "Without this flag, every run uses the deterministic rule-based "
                          "fallback -- honestly labelled in cost_split, not hidden.")
     ap.add_argument("--decdet-reps", type=int, default=5)
@@ -209,9 +209,9 @@ def main():
 
     os.makedirs(a.out, exist_ok=True)
 
-    api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    api_key_present = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
     if a.use_llm and not api_key_present:
-        print("WARNING: --use-llm was passed but ANTHROPIC_API_KEY is not set. "
+        print("WARNING: --use-llm was passed but GEMINI_API_KEY is not set. "
              "Every L5 call will silently use the rule-based fallback instead -- "
              "this run will NOT reflect real LLM cost or behavior.")
 

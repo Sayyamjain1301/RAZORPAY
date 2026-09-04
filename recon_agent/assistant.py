@@ -5,16 +5,18 @@ handed a compact summary of the run (metrics + settlement results), told
 never to invent facts outside that payload, and answers in plain finance
 language. It has no write access to anything — it only ever returns text.
 
-Graceful degradation matches the rest of the app: no ANTHROPIC_API_KEY, or a
+Graceful degradation matches the rest of the app: no GEMINI_API_KEY, or a
 failed call, falls back to a deterministic templated answer and labels the
 source honestly (never lets a rule-based guess pass as a live model answer).
+
+Provider: Google Gemini, via the `google-genai` SDK.
 """
 from __future__ import annotations
 
 import json
 import os
 
-DEFAULT_MODEL = os.environ.get("RECON_LLM_MODEL", "claude-3-5-haiku-20241022")
+DEFAULT_MODEL = os.environ.get("RECON_LLM_MODEL", "gemini-3.6-flash")
 
 QUICK_QUESTIONS = [
     "Why is the auto-match rate not 100%?",
@@ -57,6 +59,20 @@ def _rule_based_answer(question: str, metrics: dict, settlements: list[dict]) ->
             return f"No pending confirmations are under {threshold}% confidence in this run."
         lines = "; ".join(f"{s['txn_id']} ({s['confidence']}%)" for s in matches)
         return f"{len(matches)} pending confirmation(s) under {threshold}% confidence: {lines}."
+
+    if "false positive" in q:
+        return ("A false positive here means the LLM investigator proposed an invoice for a "
+               "settlement that layers 1-4 alone would have correctly left as an exception -- "
+               "the A/B comparison tab scores every such proposal against hidden ground truth and "
+               "reports both the count it got right and the count it got wrong, not just the ones "
+               "it got right.")
+
+    if "isn't the llm's contribution" in q or "not always positive" in q or "always positive" in q:
+        return ("The LLM only ever sees settlements layers 1-4 couldn't resolve deterministically "
+               "-- by definition the hardest, most ambiguous residual. It can genuinely improve "
+               "recall on some of those, but it can also occasionally propose a plausible-looking "
+               "wrong answer on others. The A/B tab measures both directions honestly instead of "
+               "only reporting the wins.")
 
     if "honeypot" in q:
         return ("Honeypots are adversarial credits injected by data_gen.py: same amount as a "
@@ -129,7 +145,7 @@ def _rule_based_answer(question: str, metrics: dict, settlements: list[dict]) ->
 
     if "no api key" in q or "no key" in q or "without" in q and "key" in q:
         return ("Layer 5 falls back to a deterministic, explainable rule-based investigator instead "
-               "of calling Claude — it picks the highest-scoring candidate if it clears a confidence "
+               "of calling Gemini — it picks the highest-scoring candidate if it clears a confidence "
                "bar, and says so honestly in the rationale, labelled 'rule_based_fallback' rather "
                "than pretending to be a model answer.")
 
@@ -180,28 +196,35 @@ def _rule_based_answer(question: str, metrics: dict, settlements: list[dict]) ->
     if txn_hit:
         return f"{txn_hit['txn_id']} — status {txn_hit['status']}, layer {txn_hit['layer']}. {txn_hit['rationale']}"
 
-    return ("No ANTHROPIC_API_KEY set, so this is the rule-based fallback — it can answer "
+    return ("No GEMINI_API_KEY set, so this is the rule-based fallback — it can answer "
            "questions about match rate, exception priority, or deduction variance. Try one "
            "of the quick questions, or ask about a specific txn ID.")
 
 
 def ask(question: str, metrics: dict, settlements: list[dict], *, use_llm: bool = True) -> dict:
     """Returns {answer, source}. source is 'llm' or 'rule_based_fallback', never blurred."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not use_llm or not api_key:
         return {"answer": _rule_based_answer(question, metrics, settlements), "source": "rule_based_fallback"}
 
     try:
-        import anthropic
+        from google import genai
+        from google.genai import types as genai_types
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client = genai.Client(api_key=api_key)
         payload = _context_payload(metrics, settlements)
-        message = client.messages.create(
-            model=DEFAULT_MODEL, max_tokens=300, temperature=0.2, system=SYSTEM_PROMPT,
-            messages=[{"role": "user",
-                      "content": json.dumps(payload, default=str) + "\n\nQuestion: " + question}],
+        response = client.models.generate_content(
+            model=DEFAULT_MODEL,
+            contents=json.dumps(payload, default=str) + "\n\nQuestion: " + question,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT, temperature=0.2,
+                # see llm_reasoner.py's comment on the same constant --
+                # gemini-3.6-flash spends part of its output budget on
+                # internal reasoning before the visible answer.
+                max_output_tokens=2048,
+            ),
         )
-        text = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
+        text = (response.text or "").strip()
         return {"answer": text or "(no answer returned)", "source": "llm"}
     except Exception as exc:  # noqa: BLE001 — must degrade gracefully, never crash the console
         fallback = _rule_based_answer(question, metrics, settlements)

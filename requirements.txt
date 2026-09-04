@@ -1,4 +1,5 @@
 streamlit>=1.38
 pandas>=2.0
 rapidfuzz>=3.5
-anthropic>=0.34
+google-genai>=1.0
+reportlab>=4.0

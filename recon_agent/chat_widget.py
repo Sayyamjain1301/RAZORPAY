@@ -72,6 +72,10 @@ QUICK_PRE_RUN = [
 # item 18: starter chips change based on which tab is active, not just a
 # single generic "dashboard" bucket.
 QUICK_BY_TAB = {
+    "A/B: LLM impact": [
+        "Why isn't the LLM's contribution always positive?",
+        "What counts as a false positive here?",
+    ],
     "Overview": [
         "Why is the auto-match rate not 100%?",
         "What's the difference between precision and recall here?",

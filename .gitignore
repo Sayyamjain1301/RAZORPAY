@@ -10,3 +10,5 @@ eval_out/
 .mypy_cache/
 .pytest_cache/
 _v2_backup/
+data/*.log
+data/_state_*.json

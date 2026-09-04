@@ -413,7 +413,7 @@ footer .foot-links a:hover{ color:#fff; }
     <input id="chat-input" type="text" placeholder="Type a question…">
     <button id="chat-send">Send</button>
   </div>
-  <div class="chat-caption">Powered by the same agent, read-only — canned answers on this page; the live console gives real Claude-backed answers.</div>
+  <div class="chat-caption">Powered by the same agent, read-only — canned answers on this page; the live console gives real Gemini-backed answers.</div>
 </div>
 
 <script>
@@ -512,7 +512,7 @@ footer .foot-links a:hover{ color:#fff; }
   function fallback() {
     return 'This page runs on canned answers only — no live model call happens from a static page (no safe place ' +
            'to hold an API key client-side). Try one of the suggested questions, or open the console for a real, ' +
-           'Claude-backed answer.';
+           'Gemini-backed answer.';
   }
 
   function answer(q) {

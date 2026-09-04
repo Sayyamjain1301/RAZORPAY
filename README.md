@@ -124,7 +124,7 @@ module that talks to an LLM, and it is scoped narrowly on purpose:
 - Every proposal surfaces in the dashboard as **pending confirmation** and
   stays that way until a human clicks Confirm. Nothing closes a ledger entry
   without a human in the loop.
-- If no `ANTHROPIC_API_KEY` is set, or the API call fails for any reason, it
+- If no `GEMINI_API_KEY` is set, or the API call fails for any reason, it
   transparently falls back to a deterministic, explainable rule-based
   investigator — the pipeline never crashes and never silently blocks.
 
@@ -187,18 +187,18 @@ streamlit run app.py
 Run from the terminal instead (no browser):
 
 ```bash
-python run_cli.py            # uses live Claude API if ANTHROPIC_API_KEY is set
+python run_cli.py            # uses live Gemini API if GEMINI_API_KEY is set
 python run_cli.py --no-llm   # force the deterministic rule-based fallback
 ```
 
 To enable the live LLM investigator, set your API key first:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=...   # from Google AI Studio / Cloud Console
 ```
 
 Without it, everything still runs end-to-end — layer 5 just uses the
-rule-based fallback instead of calling out to Claude, and says so in its
+rule-based fallback instead of calling out to Gemini, and says so in its
 rationale.
 
 ## Known limitations / roadmap
