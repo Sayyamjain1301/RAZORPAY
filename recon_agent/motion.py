@@ -44,6 +44,11 @@ COUNTUP_MS = 800
 STAGGER_MS = 15
 TICKER_STAGGER_MS = 300
 TICKER_CAP_MS = 2500
+PIPELINE_FLOW_STAGGER_MS = 450
+PIPELINE_FLOW_COUNT_MS = 550
+PIPELINE_FLOW_N_NODES = 5
+# 4 gaps between 5 nodes, plus the last node's own count-up, plus a small buffer
+PIPELINE_FLOW_TOTAL_MS = (PIPELINE_FLOW_N_NODES - 1) * PIPELINE_FLOW_STAGGER_MS + PIPELINE_FLOW_COUNT_MS + 200
 
 CSS = f"""
 <style>
@@ -131,6 +136,27 @@ input[type="checkbox"], input, textarea, select {{
     padding-bottom: 10px !important;
 }}
 .rp-tabbtn-active button {{ color: #012652 !important; }}
+
+/* ---- KPI tile value: soft pop-in the first time a run's value is shown -- */
+@keyframes rp-kpi-pop {{ from {{ opacity: 0; transform: translateY(4px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+.rp-kpi-fresh {{ animation: rp-kpi-pop 300ms ease-out; display: inline-block; }}
+
+/* ---- KPI tile sparkline: draws in left-to-right on first paint --------- */
+@keyframes rp-spark-draw {{ from {{ stroke-dashoffset: 100; }} to {{ stroke-dashoffset: 0; }} }}
+.rp-spark polyline {{ stroke-dasharray: 100; animation: rp-spark-draw 500ms ease-out 200ms both; }}
+
+/* ---- layer bar segments grow from 0 on first paint, staggered ---------- */
+/* No explicit `to` keyframe: the browser fills it in from each segment's
+   own inline `style="width:X%"`, so this animates 0 -> its real width
+   without JS needing to know the target. */
+@keyframes rp-seg-grow {{ from {{ width: 0; }} }}
+.rp-layerbar-seg {{ animation: rp-seg-grow 500ms ease-out both; }}
+.rp-layerbar-seg:nth-child(1) {{ animation-delay: 0ms; }}
+.rp-layerbar-seg:nth-child(2) {{ animation-delay: 60ms; }}
+.rp-layerbar-seg:nth-child(3) {{ animation-delay: 120ms; }}
+.rp-layerbar-seg:nth-child(4) {{ animation-delay: 180ms; }}
+.rp-layerbar-seg:nth-child(5) {{ animation-delay: 240ms; }}
+.rp-layerbar-seg:nth-child(6) {{ animation-delay: 300ms; }}
 
 /* ---- activity log drawer: slides up from the bottom of the results pane -- */
 .st-key-activity_drawer {{
@@ -269,6 +295,80 @@ def count_down_to_zero(start_value: int, *, duration_ms: int = 500, height: int 
         }}
         requestAnimationFrame(tick);
     }})();
+    </script>
+    """
+    st.iframe(src=html, height=height)
+
+
+def pipeline_flow(nodes: list[dict], *, stagger_ms: int = 450, count_ms: int = 550,
+                  height: int = 150, elem_id: str = "pflow") -> None:
+    """The centerpiece pipeline visualization: N nodes left-to-right, each
+    counting up from 0 to its REAL settlement count (caller passes actual
+    per-layer counts from the run that just finished — see app.py's call
+    site — never fabricated), with the connecting line filling in behind
+    it and the node lighting up (border + fill) exactly when its count-up
+    finishes. Node N (the LLM investigator, by convention the thinnest/last
+    slice) lights up last, visually reinforcing that it only ever sees what
+    the deterministic layers upstream couldn't close.
+
+    Single self-contained iframe, same reduced-motion guard and easing as
+    every other primitive in this module."""
+    n = len(nodes)
+    node_divs, line_divs, scripts = [], [], []
+    for i, item in enumerate(nodes):
+        label, count = item["label"], item["count"]
+        node_divs.append(f"""
+        <div class="pf-node" style="flex:1;text-align:center;position:relative;z-index:1">
+            <div id="{elem_id}-n{i}" class="pf-circle" style="
+                width:44px;height:44px;border-radius:50%;margin:0 auto 8px;
+                background:#fff;border:2px solid #E5E8EC;color:#6B7280;
+                display:flex;align-items:center;justify-content:center;
+                font:700 15px/1 Inter,sans-serif;font-variant-numeric:tabular-nums;
+                transition:border-color 200ms ease-out,background-color 200ms ease-out,color 200ms ease-out;
+            ">0</div>
+            <div style="font-size:11px;color:#1A1F2B;font-weight:500;line-height:1.3;padding:0 4px">{label}</div>
+        </div>""")
+        if i < n - 1:
+            line_divs.append(f"""
+            <div style="flex:0 0 auto;width:{100 // max(n - 1, 1)}%;max-width:60px;
+                        height:2px;background:#E5E8EC;position:relative;top:22px;margin-top:-22px;
+                        overflow:hidden">
+                <div id="{elem_id}-l{i}" style="height:100%;width:0%;background:#0D94FB;
+                     transition:width 250ms ease-out"></div>
+            </div>""")
+        scripts.append(f"""
+        (function() {{
+            const el = document.getElementById("{elem_id}-n{i}");
+            const line = document.getElementById("{elem_id}-l{i}");
+            const target = {count};
+            const delay = reduced ? 0 : {i * stagger_ms};
+            const dur = reduced ? 0 : {count_ms};
+            function light() {{
+                el.style.borderColor = "#0D94FB";
+                el.style.background = "#0D94FB";
+                el.style.color = "#fff";
+                if (line) line.style.width = "100%";
+            }}
+            setTimeout(function() {{
+                if (dur === 0) {{ el.textContent = target; light(); return; }}
+                const start = performance.now();
+                function ease(t) {{ return 1 - Math.pow(1 - t, 3); }}
+                function tick(now) {{
+                    const p = Math.min(1, (now - start) / dur);
+                    el.textContent = Math.round(target * ease(p));
+                    if (p < 1) requestAnimationFrame(tick);
+                    else {{ el.textContent = target; light(); }}
+                }}
+                requestAnimationFrame(tick);
+            }}, delay);
+        }})();""")
+
+    row = "".join(v for pair in zip(node_divs, line_divs + [""]) for v in pair if v)
+    html = f"""
+    <div style="display:flex;align-items:flex-start;padding:8px 4px">{row}</div>
+    <script>
+    {reduced_motion_guard()}
+    {"".join(scripts)}
     </script>
     """
     st.iframe(src=html, height=height)

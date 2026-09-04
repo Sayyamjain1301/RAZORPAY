@@ -1,5 +1,7 @@
 # Payment Reconciliation Agent
 
+**Project overview page:** https://sayyamjain1301.github.io/RAZORPAY/
+
 **Track:** AI Finance Controller — Razorpay AI Buildathon 2026
 **Brief:** *"Build an agent that closes one finance-ops loop across a 50+ record batch of synthetic data, reporting its match rate."*
 
@@ -200,6 +202,31 @@ export GEMINI_API_KEY=...   # from Google AI Studio / Cloud Console
 Without it, everything still runs end-to-end — layer 5 just uses the
 rule-based fallback instead of calling out to Gemini, and says so in its
 rationale.
+
+## Console UX
+
+Beyond the matching pipeline itself, the Streamlit console (`app.py`) adds:
+
+- **Cold-start auto-seed** — a fresh deploy with no `data/` yet (Streamlit
+  Cloud, a fresh clone) seeds a starter batch automatically instead of
+  showing a blank info banner.
+- **Take the tour** (sidebar) — seeds a batch with every scenario type,
+  runs the real pipeline, and walks the actual dashboard tab-by-tab with a
+  floating step-through overlay. Never a staged/fake run — the same
+  `run_pipeline_once()` the manual Run button uses.
+- **Pipeline flow diagram** — an animated 5-node visualization shown right
+  after a run finishes, each node counting up to its real settlement count
+  in order, so the "cheap deterministic layers first, LLM only on the
+  residue" thesis is the first thing you see, not a line in a README.
+- **Assistant as a control surface** — the floating AI assistant (present
+  on every page) doesn't just answer questions; a request like *"show me
+  every pending confirmation under 70% confidence"* actually applies that
+  filter on the Reconciliation tab, switching tabs if needed. Narrow by
+  design: it only ever sets state to something backed by real, currently-
+  present data.
+- **KPI sparklines** — each Reconciliation-tab KPI tile shows a small trend
+  line across recent runs, built from the same run-history file the
+  Overview tab's trend chart already uses.
 
 ## Known limitations / roadmap
 

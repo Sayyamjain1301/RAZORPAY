@@ -246,6 +246,19 @@ input::placeholder, textarea::placeholder {{ color: {SLATE} !important; }}
     padding:5px 0; border-bottom:1px solid {LIGHT_GRAY}; color:{NEAR_BLACK};
 }}
 .rp-drawer-row.head {{ color:{SLATE}; font-weight:600; text-transform:uppercase; letter-spacing:0.03em; font-size:10.5px; }}
+
+/* ---- guided tour overlay: bottom-left, mirrors the chat widget's fixed-
+   position convention on the opposite corner so the two never collide ---- */
+.st-key-tour_overlay {{
+    position: fixed !important; bottom: 24px; left: 24px; z-index: 9997; width: 300px;
+    background: {PRUSSIAN_BLUE}; border-radius: 14px; padding: 14px 16px 10px;
+    box-shadow: 0 12px 40px rgba(1,38,82,0.28);
+    animation: rp-kpi-pop 220ms ease-out;
+}}
+.rp-tour-title {{ display:flex; align-items:center; gap:7px; font-weight:700; color:{WHITE}; font-size:13px; margin-bottom:4px; }}
+.rp-tour-title svg {{ stroke:{DODGER_BLUE}; }}
+.rp-tour-text {{ color:#C7D3E0; font-size:12px; line-height:1.5; margin-bottom:8px; }}
+.st-key-tour_overlay button {{ font-size:12px !important; }}
 </style>
 """
 
@@ -280,6 +293,33 @@ def trend_arrow(delta: float | None, *, pct_points: bool = True) -> str:
     if delta > 0:
         return f'<span class="rp-trend rp-trend-up">{icon("arrow-up", 11)}{delta:+.1f}{unit}</span>'
     return f'<span class="rp-trend rp-trend-down">{icon("arrow-down", 11)}{delta:+.1f}{unit}</span>'
+
+
+def sparkline_svg(values: list[float], *, width: int = 64, height: int = 20,
+                  color: str = DODGER_BLUE) -> str:
+    """Tiny inline trend line across recent runs for a KPI tile — plain
+    SVG (no JS/iframe needed, unlike the count-up primitives in motion.py),
+    real history values only, never a placeholder shape. Fewer than 2
+    points can't describe a trend, so callers get an empty string back."""
+    if len(values) < 2:
+        return ""
+    lo, hi = min(values), max(values)
+    span = (hi - lo) or 1.0
+    n = len(values)
+    pad = 2
+    pts = [
+        (pad + i * (width - 2 * pad) / (n - 1),
+         height - pad - (v - lo) / span * (height - 2 * pad))
+        for i, v in enumerate(values)
+    ]
+    path = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    last_x, last_y = pts[-1]
+    return (f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+           f'style="display:block" class="rp-spark">'
+           f'<polyline points="{path}" pathLength="100" fill="none" stroke="{color}" stroke-width="1.5" '
+           f'stroke-linejoin="round" stroke-linecap="round"/>'
+           f'<circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="2" fill="{color}"/>'
+           f'</svg>')
 
 
 _LAYER_VERBS = {

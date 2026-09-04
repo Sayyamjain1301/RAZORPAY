@@ -17,6 +17,8 @@ a true statement, not copy.
 """
 from __future__ import annotations
 
+import re
+
 import streamlit as st
 
 from . import assistant
@@ -100,6 +102,62 @@ QUICK_BY_TAB = {
 }
 
 
+# item: the assistant as a control surface, not just Q&A — a small, explicit
+# set of natural-language filter requests actually drives the Reconciliation
+# tab's real filter widgets (recon_search / recon_band_filter / layer_filter_
+# active), rather than only describing the answer in prose. Deliberately
+# narrow: it only ever sets state to something backed by real, currently-
+# present data (a real layer that appears in this run, a real txn_id), and
+# only when the phrasing is unambiguously a "show me" request — never a
+# guess dressed up as an action.
+_LAYER_KEYWORDS = {
+    "partial payment": "exact_reference+partial_payment",
+    "subset-sum": "amount_date_subset_sum", "subset sum": "amount_date_subset_sum",
+    "batch": "anchored_batch_completion",
+    "llm investigator": "llm_investigator", "investigator": "llm_investigator",
+    "llm": "llm_investigator",
+}
+_BAND_KEYWORDS = {
+    "high confidence": "High", "low confidence": "Low", "medium confidence": "Medium",
+    "needs review": "Medium", "uncertain": "Low",
+}
+_ACTION_PHRASES = ("show me", "show all", "filter to", "filter for", "find me",
+                  "list all", "list every", "which pending", "which settlements",
+                  "which exception")
+
+
+def filter_intent(question: str, settlements: list[dict]) -> dict | None:
+    """Returns {band?, layer?, search?} to apply to the Reconciliation tab's
+    real filter widgets, or None if this question isn't an unambiguous
+    filter request. Exposed at module level so it's independently testable."""
+    q = question.lower()
+    if not any(p in q for p in _ACTION_PHRASES):
+        return None
+
+    intent: dict = {}
+    m = re.search(r"\b(?:under|below|less than)\s+(\d+)\s*%", q)
+    if m and "confidence" in q:
+        thr = int(m.group(1))
+        intent["band"] = "Low" if thr <= 55 else ("Medium" if thr <= 80 else "High")
+    else:
+        for phrase, band in _BAND_KEYWORDS.items():
+            if phrase in q:
+                intent["band"] = band
+                break
+
+    present_layers = {s["layer"] for s in settlements}
+    for phrase, layer in _LAYER_KEYWORDS.items():
+        if phrase in q and layer in present_layers:
+            intent["layer"] = layer
+            break
+
+    txn_hit = next((s for s in settlements if s["txn_id"].upper() in question.upper()), None)
+    if txn_hit:
+        intent["search"] = txn_hit["txn_id"]
+
+    return intent or None
+
+
 def _chips_for(page_context: str, settlements, focused_txn, active_tab: str | None) -> list[str]:
     if focused_txn:
         return [f"Explain {focused_txn}'s match in plain English", f"What would break {focused_txn}'s match?"]
@@ -174,6 +232,19 @@ def render(page_context: str, *, metrics: dict | None = None,
         active_q = chip_clicked or (typed if sent and typed else None)
         if active_q:
             result = assistant.ask(active_q, metrics or {}, settlements or [], use_llm=use_llm)
+            intent = filter_intent(active_q, settlements or [])
+            if intent:
+                if "band" in intent:
+                    st.session_state["recon_band_filter"] = intent["band"]
+                if "layer" in intent:
+                    st.session_state["recon_layer_dd"] = intent["layer"]
+                    st.session_state["layer_filter_active"] = intent["layer"]
+                if "search" in intent:
+                    st.session_state["recon_search"] = intent["search"]
+                    st.session_state.setdefault("expanded_rows", set()).add(intent["search"])
+                st.session_state["active_tab"] = "Reconciliation"
+                result = {**result, "answer": result["answer"]
+                         + " I've applied that filter on the Reconciliation tab."}
             st.session_state["widget_chat_log"].append({"q": active_q, **result})
             st.session_state["chat_open"] = True
             st.rerun()
