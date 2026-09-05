@@ -94,6 +94,12 @@ CSS = f"""
     --rp-blue: {DODGER_BLUE}; --rp-navy: {PRUSSIAN_BLUE}; --rp-ink: {NEAR_BLACK};
     --rp-slate: {SLATE}; --rp-border: {LIGHT_GRAY}; --rp-offwhite: {OFF_WHITE};
     --rp-green: {GREEN}; --rp-amber: {AMBER}; --rp-red: {RED};
+    /* Themeable heading/amount ink: Prussian Blue reads as the strong
+       "primary text" colour on white, but is near-invisible on black, so
+       app.py's dark-mode block redefines just this one variable rather
+       than !important-overriding every .rp-amount (which would also
+       flatten the semantic green/amber/red on the value tiles). */
+    --rp-heading: {PRUSSIAN_BLUE};
 }}
 
 html, body, [class*="css"] {{ font-variant-numeric: lining-nums tabular-nums; }}

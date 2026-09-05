@@ -67,17 +67,60 @@ for _key_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
 
 st.session_state.setdefault("dark_mode", False)
 if st.session_state["dark_mode"]:
-    # Dark mode is Prussian Blue itself as the base (see its "dark-mode
-    # base" comment in ui_theme.py), with everything else a White-at-
-    # various-opacity derivation on top -- no separate near-black gray
-    # scale invented for it, so it stays strictly Razorpay Blue + White.
+    # True black base. Black and white are neutrals, not hues, so this
+    # doesn't break the "Razorpay colours only" rule -- Dodger Blue stays
+    # the one accent, and every surface/text tone here is White at some
+    # opacity over black (standard dark-mode elevation), never a separate
+    # invented gray scale.
+    #
+    # The !important overrides are doing real work: a lot of this app's
+    # colour lives in INLINE styles inside f-strings (color:#012652 on
+    # amounts, the off-white cost strip, etc). Those are dark-on-light by
+    # construction and would be invisible on black, so they're re-pointed
+    # here by class rather than being made conditional at every call site.
     st.markdown("""<style>
-        [data-testid="stAppViewContainer"] { background: #012652 !important; }
-        [data-testid="stSidebar"] { background: #012652 !important;
+        [data-testid="stAppViewContainer"], [data-testid="stHeader"],
+        [data-testid="stBottom"] { background: #000000 !important; }
+        [data-testid="stSidebar"] { background: rgba(255,255,255,0.03) !important;
             border-right: 1px solid rgba(255,255,255,0.12) !important; }
-        .rp-card { background: rgba(255,255,255,0.06) !important; border-color: rgba(255,255,255,0.15) !important; }
-        body, p, span, div, label, li { color: rgba(255,255,255,0.92); }
-        [data-testid="stMetricLabel"] { color: rgba(255,255,255,0.55) !important; }
+
+        /* lifted surfaces */
+        .rp-card, [data-testid="stExpander"], [data-testid="stNotification"] {
+            background: rgba(255,255,255,0.05) !important;
+            border-color: rgba(255,255,255,0.14) !important;
+        }
+        .rp-divider { border-top-color: rgba(255,255,255,0.14) !important; }
+
+        /* text: re-point the dark-on-light inline colours */
+        body, p, span, div, label, li, td, th { color: rgba(255,255,255,0.92); }
+        h1, h2, h3, h4, h5, h6 { color: #FFFFFF !important; }
+        /* one variable flip re-points every "primary ink" usage; the
+           semantic green/amber/red on the value tiles keep their meaning */
+        :root { --rp-heading: rgba(255,255,255,0.95); }
+        .rp-mono { color: rgba(255,255,255,0.90) !important; }
+        .rp-empty, [data-testid="stMetricLabel"], [data-testid="stCaptionContainer"] {
+            color: rgba(255,255,255,0.55) !important;
+        }
+        .rp-status-row { color: rgba(255,255,255,0.92) !important; }
+        .rp-tag { background: rgba(255,255,255,0.08) !important;
+                  color: rgba(255,255,255,0.80) !important;
+                  border-color: rgba(255,255,255,0.16) !important; }
+
+        /* inputs / code / tables */
+        input, textarea, select, [data-baseweb="select"] > div {
+            background: rgba(255,255,255,0.06) !important;
+            color: rgba(255,255,255,0.92) !important;
+            border-color: rgba(255,255,255,0.18) !important;
+        }
+        code, pre, [data-testid="stCode"] {
+            background: rgba(255,255,255,0.06) !important;
+            color: rgba(255,255,255,0.90) !important;
+        }
+        [data-testid="stDataFrame"], [data-testid="stTable"] {
+            background: rgba(255,255,255,0.04) !important;
+        }
+        /* the metric value keeps Dodger Blue -- still the one accent */
+        [data-testid="stMetricValue"] { color: #0D94FB !important; }
     </style>""", unsafe_allow_html=True)
 
 for key, default in [
@@ -405,7 +448,7 @@ if "recon_out" not in st.session_state:
 
     st.markdown(
         f'<div class="rp-card">'
-        f'<div style="display:flex;align-items:center;gap:8px;font-weight:600;color:#012652">'
+        f'<div style="display:flex;align-items:center;gap:8px;font-weight:600;color:var(--rp-heading)">'
         f'{icon("check-circle", 16)}What happens when you click Run</div>'
         f'{mini_pipeline(_step5)}'
         f'<div style="color:#6B7280;font-size:12.5px;margin-top:6px">'
@@ -692,7 +735,7 @@ if active_tab == "Overview":
                     for _ri, (label, amt, color, note) in enumerate(rows))
                 st.markdown(f'<div class="rp-card">{body}'
                            f'<div style="margin-top:8px;font-size:11.5px;color:#6B7280">'
-                           f'Effective deduction rate: <strong style="color:#012652">'
+                           f'Effective deduction rate: <strong style="color:var(--rp-heading)">'
                            f'{leak["effective_rate"]*100:.2f}%</strong> of gross</div></div>',
                            unsafe_allow_html=True)
             else:
@@ -717,7 +760,7 @@ if active_tab == "Overview":
                         f'<div style="display:flex;justify-content:space-between;font-size:11.5px;'
                         f'margin-bottom:3px"><span style="color:#1A1F2B">{label} '
                         f'<span style="color:#6B7280">({b["count"]})</span></span>'
-                        f'<span class="rp-amount" style="color:#012652">{fmt_inr_compact(b["value"])}</span></div>'
+                        f'<span class="rp-amount" style="color:var(--rp-heading)">{fmt_inr_compact(b["value"])}</span></div>'
                         f'<div style="height:6px;background:#E5E8EC;border-radius:3px;overflow:hidden">'
                         f'<div class="rp-layerbar-seg" style="width:{pctw:.2f}%;height:100%;'
                         f'background:{BUCKET_COLOR[label]}"></div></div></div>')
@@ -818,7 +861,7 @@ elif active_tab == "Reconciliation":
                 f'<div class="rp-card" style="padding:12px 14px">'
                 f'<div style="display:flex;align-items:center;gap:6px;color:#6B7280;font-size:11.5px">'
                 f'{icon("check-circle", 13)}{label}</div>'
-                f'<div class="rp-amount {fresh_cls}" style="font-size:1.4rem;color:#012652;margin-top:3px">{val_str}</div>'
+                f'<div class="rp-amount {fresh_cls}" style="font-size:1.4rem;color:var(--rp-heading);margin-top:3px">{val_str}</div>'
                 f'<div style="display:flex;align-items:center;justify-content:space-between;margin-top:3px">'
                 f'<span>{trend_arrow(_delta_pp(key))}</span>{spark}</div>'
                 f'</div>', unsafe_allow_html=True)
