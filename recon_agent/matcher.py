@@ -30,7 +30,13 @@ from datetime import date
 from itertools import combinations
 from typing import Optional
 
-from rapidfuzz import fuzz
+try:
+    from rapidfuzz import fuzz
+except ImportError:
+    # No official Pyodide/wasm wheel for this C extension -- only reached
+    # inside the in-browser stlite build (web/), never on the real server.
+    # See _fuzz_fallback.py's module docstring.
+    from ._fuzz_fallback import fuzz
 
 from .fee_schedule import load_fee_schedule
 from .llm_reasoner import investigate

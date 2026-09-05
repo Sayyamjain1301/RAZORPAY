@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>Reconciliation Agent — in-browser demo</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@1.8.1/build/stlite.css" />
+  <style>
+    html, body, #root { height: 100%; margin: 0; }
+    #boot {
+      position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 10px; font-family: -apple-system, Inter, sans-serif;
+      background: #F5F7FA; color: #012652; z-index: 10000; transition: opacity 200ms ease-out;
+    }
+    #boot .spin {
+      width: 28px; height: 28px; border-radius: 50%; border: 3px solid #E5E8EC;
+      border-top-color: #0D94FB; animation: spin 800ms linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #boot .note { color: #6B7280; font-size: 12.5px; max-width: 380px; text-align: center; }
+    #boot.hidden { opacity: 0; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <!--
+    This is a SEPARATE deployment target from the real Streamlit Cloud app
+    (see README.md's "Live demo" links). Vercel is serverless with no
+    persistent-process/WebSocket model, which is what Streamlit itself
+    needs -- see the commit history for why. This page instead runs the
+    exact same app.py through stlite (github.com/whitphx/stlite), which
+    compiles Streamlit + a real CPython to WebAssembly via Pyodide and
+    executes it ENTIRELY in your browser -- Vercel only ever serves static
+    files, never runs Python.
+
+    Two real, accepted differences from the server deployment:
+      1. No live Gemini calls -- google-genai isn't in `requirements`
+         below (Pyodide has no working async HTTP story for its sync
+         client), so the LLM investigator always uses its rule-based
+         fallback here, exactly like the "no API key" path on the real
+         deployment (same tested code, not a special case).
+      2. rapidfuzz (a C extension with no official Pyodide wheel) is
+         swapped for recon_agent/_fuzz_fallback.py's pure-Python
+         difflib-based equivalent -- see that module's docstring. Scores
+         track rapidfuzz closely but aren't bit-identical. matcher.py only
+         reaches that fallback when `import rapidfuzz` genuinely fails, so
+         the real server deployment (where rapidfuzz installs normally)
+         is completely unaffected.
+  -->
+  <div id="boot">
+    <div class="spin"></div>
+    <div>Booting a full Python runtime in your browser…</div>
+    <div class="note">First load only — downloading CPython (via Pyodide/WebAssembly) and
+      this app's dependencies. Nothing is sent to a server; everything from here runs
+      entirely on your machine.</div>
+  </div>
+  <div id="root"></div>
+
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@1.8.1/build/stlite.js";
+
+    mount(
+      {
+        requirements: ["pandas", "reportlab", "altair"],
+        entrypoint: "app.py",
+        files: {
+          "app.py": { url: "/app.py" },
+          "data_gen.py": { url: "/data_gen.py" },
+          "evaluate.py": { url: "/evaluate.py" },
+          "recon_agent/__init__.py": { url: "/recon_agent/__init__.py" },
+          "recon_agent/_fuzz_fallback.py": { url: "/recon_agent/_fuzz_fallback.py" },
+          "recon_agent/anomaly.py": { url: "/recon_agent/anomaly.py" },
+          "recon_agent/assistant.py": { url: "/recon_agent/assistant.py" },
+          "recon_agent/audit.py": { url: "/recon_agent/audit.py" },
+          "recon_agent/chat_widget.py": { url: "/recon_agent/chat_widget.py" },
+          "recon_agent/fee_schedule.py": { url: "/recon_agent/fee_schedule.py" },
+          "recon_agent/insights.py": { url: "/recon_agent/insights.py" },
+          "recon_agent/llm_reasoner.py": { url: "/recon_agent/llm_reasoner.py" },
+          "recon_agent/matcher.py": { url: "/recon_agent/matcher.py" },
+          "recon_agent/motion.py": { url: "/recon_agent/motion.py" },
+          "recon_agent/ops.py": { url: "/recon_agent/ops.py" },
+          "recon_agent/pdf_report.py": { url: "/recon_agent/pdf_report.py" },
+          "recon_agent/rules.py": { url: "/recon_agent/rules.py" },
+          "recon_agent/state_store.py": { url: "/recon_agent/state_store.py" },
+          "recon_agent/ui_theme.py": { url: "/recon_agent/ui_theme.py" },
+          "config/merchant_fee_schedules.csv": { url: "/config/merchant_fee_schedules.csv" },
+        },
+      },
+      document.getElementById("root"),
+    );
+
+    // Streamlit's own frontend paints once Pyodide + the app module finish
+    // loading; there's no explicit "ready" callback in this API, so watch
+    // for its first real DOM content and fade the boot screen out then.
+    const boot = document.getElementById("boot");
+    const root = document.getElementById("root");
+    const observer = new MutationObserver(() => {
+      if (root.querySelector('[data-testid="stApp"]')) {
+        boot.classList.add("hidden");
+        observer.disconnect();
+      }
+    });
+    observer.observe(root, { childList: true, subtree: true });
+  </script>
+</body>
+</html>
