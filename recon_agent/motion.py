@@ -42,6 +42,8 @@ CROSSFADE_MS = 150
 BADGE_FADE_MS = 150
 COUNTUP_MS = 800
 STAGGER_MS = 15
+RISE_MS = 320             # staggered card/row entry
+RISE_STAGGER_MS = 55      # gap between consecutive items in one group
 TICKER_STAGGER_MS = 300
 TICKER_CAP_MS = 2500
 PIPELINE_FLOW_STAGGER_MS = 450
@@ -141,6 +143,17 @@ input[type="checkbox"], input, textarea, select {{
 @keyframes rp-kpi-pop {{ from {{ opacity: 0; transform: translateY(4px); }} to {{ opacity: 1; transform: translateY(0); }} }}
 .rp-kpi-fresh {{ animation: rp-kpi-pop 300ms ease-out; display: inline-block; }}
 
+/* ---- staggered reveal: a group of related cards/rows arriving in reading
+   order rather than all at once. Delay is set inline per item by the call
+   site (Streamlit puts each column in its own DOM subtree, so nth-child
+   can't see across them). Applied ONLY via app.py's once-per-run gate, so
+   changing a filter or switching tabs never replays it. */
+@keyframes rp-rise-in {{
+    from {{ opacity: 0; transform: translateY(6px); }}
+    to   {{ opacity: 1; transform: translateY(0); }}
+}}
+.rp-rise {{ animation: rp-rise-in {RISE_MS}ms ease-out both; }}
+
 /* ---- KPI tile sparkline: draws in left-to-right on first paint --------- */
 @keyframes rp-spark-draw {{ from {{ stroke-dashoffset: 100; }} to {{ stroke-dashoffset: 0; }} }}
 .rp-spark polyline {{ stroke-dasharray: 100; animation: rp-spark-draw 500ms ease-out 200ms both; }}
@@ -172,29 +185,43 @@ def reduced_motion_guard(js_var: str = "reduced") -> str:
     return f"const {js_var} = window.matchMedia('(prefers-reduced-motion: reduce)').matches;"
 
 
-def count_up(value: float, *, decimals: int = 1, suffix: str = "%", prefix: str = "",
-            duration_ms: int = COUNTUP_MS, font_size: str = "2.3rem", color: str = "#0D94FB",
-            weight: int = 700, height: int = 60, elem_id: str = "cu") -> None:
-    """Renders once; animates 0 -> value on mount, ease-out cubic. Caller is
-    responsible for only invoking this when the value is genuinely new (see
-    app.py's per-run_id animated-once tracking) — a component re-mounts and
-    re-animates every time Streamlit re-executes this call, so gating When to
-    call it is what makes this 'once on load, never on re-render'."""
+def count_up(value: float, *, start: float = 0.0, decimals: int = 1, suffix: str = "%",
+            prefix: str = "", duration_ms: int = COUNTUP_MS, font_size: str = "2.3rem",
+            color: str = "#0D94FB", weight: int = 700, height: int = 60,
+            elem_id: str = "cu") -> None:
+    """Renders once; tweens `start` -> `value` on mount, ease-out cubic.
+
+    `start` defaults to 0 (a first-ever reading counts up from nothing), but
+    callers that know the PREVIOUS run's figure should pass it: animating
+    85.2 -> 87.9 shows the movement between two real states, which a
+    0 -> 87.9 count-up structurally cannot — the number visibly travels the
+    distance the run actually moved it, and the direction is legible before
+    you read the delta caption underneath. Standard data-viz motion
+    guidance treats that state-to-state transition as the animation that
+    carries real information, versus a mount flourish that carries none.
+
+    Caller is responsible for only invoking this when the value is genuinely
+    new (see app.py's per-run_id animated-once tracking) — a component
+    re-mounts and re-animates every time Streamlit re-executes this call, so
+    gating when to call it is what makes this 'once on load, never on
+    re-render'.
+    """
     html = f"""
     <div id="{elem_id}" style="font:{weight} {font_size}/1.1 Inter,-apple-system,sans-serif;
-         color:{color}; font-variant-numeric: tabular-nums; letter-spacing:-0.02em;">{prefix}0{suffix}</div>
+         color:{color}; font-variant-numeric: tabular-nums; letter-spacing:-0.02em;">{prefix}{start:.{decimals}f}{suffix}</div>
     <script>
     (function() {{
         const el = document.getElementById("{elem_id}");
+        const from = {start};
         const target = {value};
         {reduced_motion_guard()}
         if (reduced) {{ el.textContent = "{prefix}" + target.toFixed({decimals}) + "{suffix}"; return; }}
         const dur = {duration_ms};
-        const start = performance.now();
+        const t0 = performance.now();
         function ease(t) {{ return 1 - Math.pow(1 - t, 3); }}
         function tick(now) {{
-            const p = Math.min(1, (now - start) / dur);
-            const v = target * ease(p);
+            const p = Math.min(1, (now - t0) / dur);
+            const v = from + (target - from) * ease(p);
             el.textContent = "{prefix}" + v.toFixed({decimals}) + "{suffix}";
             if (p < 1) requestAnimationFrame(tick);
             else el.textContent = "{prefix}" + target.toFixed({decimals}) + "{suffix}";

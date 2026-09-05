@@ -540,12 +540,29 @@ if active_tab == "Overview":
     prev_rate = history[-2]["auto_match_rate"] if len(history) >= 2 else None
     delta = f"{(metrics['auto_match_rate'] - prev_rate)*100:+.1f}pp vs last run" if prev_rate is not None else None
 
+    def anim_once(token: str, index: int = 0) -> str:
+        """Entry-animation class + inline stagger delay, but only the first
+        time this run renders `token`. Changing the date filter or coming
+        back to this tab shows everything flat, exactly like badge_wrap()
+        and the hero count-up already behave — motion marks a genuinely new
+        state, never a re-render."""
+        key = f"{run_id}:anim:{token}"
+        if key in st.session_state["kpi_animated_runs"]:
+            return ""
+        st.session_state["kpi_animated_runs"].add(key)
+        return f'class="rp-rise" style="animation-delay:{index * motion.RISE_STAGGER_MS}ms"'
+
     hc, sc = st.columns([1, 2])
     with hc:
         st.caption("Auto-match rate")
         # ---- #1: hero KPI count-up, once per run_id, never on re-render ---
         if run_id not in st.session_state["kpi_animated_runs"]:
-            motion.count_up(metrics["auto_match_rate"] * 100, decimals=1, suffix="%",
+            # Tween from the PREVIOUS run's rate when there is one, so the
+            # number travels the distance this run actually moved it --
+            # a 0 -> current count-up would hide that entirely.
+            motion.count_up(metrics["auto_match_rate"] * 100,
+                            start=(prev_rate * 100) if prev_rate is not None else 0.0,
+                            decimals=1, suffix="%",
                             font_size="2.3rem", color="#0D94FB", height=55, elem_id=f"kpi_{run_id}")
             st.session_state["kpi_animated_runs"].add(run_id)
         else:
@@ -611,17 +628,18 @@ if active_tab == "Overview":
             ("Unreconciled", vs["exception_value"], "#DC2626", None),
         ]
         vcols = st.columns(4)
-        for col, (label, amount, color, share) in zip(vcols, VALUE_TILES):
+        for _i, (col, (label, amount, color, share)) in enumerate(zip(vcols, VALUE_TILES)):
             sub = f"{share*100:.1f}% of value" if share is not None else \
                   (f"{amount / vs['total_value'] * 100:.1f}% of value" if vs["total_value"] else "—")
             with col:
                 st.markdown(
+                    f'<div {anim_once(f"vtile{_i}", _i)}>'
                     f'<div class="rp-card" style="padding:12px 14px">'
                     f'<div style="color:#6B7280;font-size:11.5px">{label}</div>'
                     f'<div class="rp-amount" style="font-size:1.35rem;color:{color};margin-top:3px">'
                     f'{fmt_inr_compact(amount)}</div>'
                     f'<div style="color:#6B7280;font-size:11px;margin-top:2px">{sub}</div>'
-                    f'</div>', unsafe_allow_html=True)
+                    f'</div></div>', unsafe_allow_html=True)
 
         # the headline insight: when rupees and rows disagree, say so plainly
         _gap = vs["value_vs_count_pp"]
@@ -658,13 +676,15 @@ if active_tab == "Overview":
                        ("GST on fees", -leak["gst_on_fees"], "#D97706", "deducted"),
                        ("TDS withheld", -leak["tds"], "#D97706", "deducted"),
                        ("Net received", leak["net_received"], "#16A34A", "")]
+                _fee_anim = bool(anim_once("feerows"))
                 body = "".join(
                     f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
-                    f'border-bottom:1px solid #E5E8EC;font-size:12.5px">'
+                    f'border-bottom:1px solid #E5E8EC;font-size:12.5px'
+                    f'{f";animation:rp-rise-in {motion.RISE_MS}ms ease-out {_ri * motion.RISE_STAGGER_MS}ms both" if _fee_anim else ""}">'
                     f'<span style="color:#6B7280">{label}'
                     f'{f" <span style=\'font-size:10.5px\'>({note})</span>" if note else ""}</span>'
                     f'<span class="rp-amount" style="color:{color}">{fmt_inr(abs(amt))}</span></div>'
-                    for label, amt, color, note in rows)
+                    for _ri, (label, amt, color, note) in enumerate(rows))
                 st.markdown(f'<div class="rp-card">{body}'
                            f'<div style="margin-top:8px;font-size:11.5px;color:#6B7280">'
                            f'Effective deduction rate: <strong style="color:#012652">'
@@ -716,17 +736,28 @@ if active_tab == "Overview":
                       f"— clearing them removes most of the risk.")
             hdr = ('<div class="rp-drawer-row head"><span>Transaction</span><span>Counterparty</span>'
                   '<span>Status</span><span>Amount</span></div>')
+            _wl_anim = bool(anim_once("worklist"))
             body = "".join(
-                f'<div class="rp-drawer-row"><span class="rp-mono">{r["txn_id"]}</span>'
+                f'<div class="rp-drawer-row"'
+                f'{f" style=\'animation:rp-rise-in {motion.RISE_MS}ms ease-out {_wi * motion.RISE_STAGGER_MS}ms both\'" if _wl_anim else ""}>'
+                f'<span class="rp-mono">{r["txn_id"]}</span>'
                 f'<span>{r["counterparty"] or "—"}</span>'
                 f'<span>{STATUS_LABEL.get(r["status"], r["status"])}</span>'
                 f'<span class="rp-amount">{fmt_inr(r["amount"])}</span></div>'
-                for r in top)
+                for _wi, r in enumerate(top))
             st.markdown(f'<div class="rp-card">{hdr}{body}</div>', unsafe_allow_html=True)
 
     # ---- how it resolved / how it's trending, side by side ---------------
     st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
-    bc1, bc2 = st.columns(2)
+    # Streamlit's native charts render with no entry of their own. Gate the
+    # rise-in behind the same once-per-run token as everything else, by
+    # injecting the rule only on the render that should animate — a static
+    # rule would replay every time a filter moved.
+    if anim_once("charts"):
+        st.markdown(f"<style>.st-key-ov_charts {{ animation: rp-rise-in {motion.RISE_MS}ms "
+                   f"ease-out 80ms both; }}</style>", unsafe_allow_html=True)
+    _charts = st.container(key="ov_charts")
+    bc1, bc2 = _charts.columns(2)
     with bc1:
         st.markdown("**Resolution layer breakdown**")
         layer_counts = pd.Series([LAYER_LABEL.get(s["layer"], s["layer"])

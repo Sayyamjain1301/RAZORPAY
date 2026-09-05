@@ -227,6 +227,14 @@ Beyond the matching pipeline itself, the Streamlit console (`app.py`) adds:
 - **KPI sparklines** — each Reconciliation-tab KPI tile shows a small trend
   line across recent runs, built from the same run-history file the
   Overview tab's trend chart already uses.
+- **Motion that carries information** (`recon_agent/motion.py`) — every
+  animation marks a real state change, never decoration. The headline one:
+  the hero KPI tweens from the *previous run's* rate to the current one, so
+  the number visibly travels the distance the run actually moved it (a
+  0 → current count-up would hide that). Card and row groups reveal in
+  reading order with a short stagger, and each is gated to fire once per
+  run — moving a filter or switching tabs shows everything flat rather than
+  replaying. `prefers-reduced-motion` disarms all of it.
 
 ## Known limitations / roadmap
 
