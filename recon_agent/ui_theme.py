@@ -247,17 +247,19 @@ input::placeholder, textarea::placeholder {{ color: {SLATE} !important; }}
 }}
 .rp-drawer-row.head {{ color:{SLATE}; font-weight:600; text-transform:uppercase; letter-spacing:0.03em; font-size:10.5px; }}
 
-/* ---- guided tour overlay: bottom-left, mirrors the chat widget's fixed-
-   position convention on the opposite corner so the two never collide ---- */
+/* ---- guided tour banner: an ordinary in-flow block at the top of the
+   dashboard, not fixed-position -- a fixed box at bottom-left sat directly
+   on top of the sidebar's own left-hand strip (same 0-336px region a
+   collapsed/expanded Streamlit sidebar occupies), which visually stacked
+   it over sidebar controls and made its buttons unreliable to click. An
+   in-flow banner can never collide with anything else on the page. */
 .st-key-tour_overlay {{
-    position: fixed !important; bottom: 24px; left: 24px; z-index: 9997; width: 300px;
-    background: {PRUSSIAN_BLUE}; border-radius: 14px; padding: 14px 16px 10px;
-    box-shadow: 0 12px 40px rgba(1,38,82,0.28);
-    animation: rp-kpi-pop 220ms ease-out;
+    background: {PRUSSIAN_BLUE}; border-radius: 10px; padding: 14px 18px;
+    margin-bottom: 14px; animation: rp-kpi-pop 220ms ease-out;
 }}
-.rp-tour-title {{ display:flex; align-items:center; gap:7px; font-weight:700; color:{WHITE}; font-size:13px; margin-bottom:4px; }}
+.rp-tour-title {{ display:flex; align-items:center; gap:7px; font-weight:700; color:{WHITE}; font-size:13.5px; margin-bottom:4px; }}
 .rp-tour-title svg {{ stroke:{DODGER_BLUE}; }}
-.rp-tour-text {{ color:#C7D3E0; font-size:12px; line-height:1.5; margin-bottom:8px; }}
+.rp-tour-text {{ color:#C7D3E0; font-size:12.5px; line-height:1.5; margin-bottom:10px; }}
 .st-key-tour_overlay button {{ font-size:12px !important; }}
 </style>
 """

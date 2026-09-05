@@ -197,16 +197,19 @@ TOUR_STEPS = [
 
 
 def render_tour_overlay() -> None:
-    """Floating step-through overlay for 'Take the tour' — bottom-left, so
-    it never collides with the chat widget's bottom-right FAB. Advancing a
-    step just changes active_tab and re-renders; it never fakes data, it
-    only narrates the real dashboard that a manual click-through would show."""
+    """In-flow guided-tour banner at the top of the dashboard — deliberately
+    NOT position:fixed. An earlier version floated it bottom-left, which
+    sat directly on top of the sidebar's own screen region and made its
+    buttons unreliable to click; an ordinary block can't collide with
+    anything. Advancing a step just changes active_tab and re-renders; it
+    never fakes data, it only narrates the real dashboard a manual
+    click-through would show."""
     step_i = st.session_state.get("tour_step", 0)
     step = TOUR_STEPS[step_i]
     with st.container(key="tour_overlay"):
         st.markdown(f'<div class="rp-tour-title">{icon("flag", 15)}{step["title"]}</div>'
                    f'<div class="rp-tour-text">{step["text"]}</div>', unsafe_allow_html=True)
-        tc1, tc2, tc3 = st.columns([1, 1, 1])
+        tc1, tc2, tc3, _spacer = st.columns([1, 1, 1, 5])
         with tc1:
             if step_i > 0 and st.button("Back", key="tour_back", width="stretch"):
                 st.session_state["tour_step"] = step_i - 1
