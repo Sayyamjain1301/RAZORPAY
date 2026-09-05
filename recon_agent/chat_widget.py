@@ -25,7 +25,15 @@ from . import assistant
 
 CSS = """
 <style>
-.st-key-chat_fab { position: fixed !important; bottom: 24px; right: 24px; z-index: 9998; }
+/* every positioning property needs !important, not just `position` --
+   without it, any Streamlit-internal rule of equal-or-higher specificity
+   touching `right`/`bottom` wins, and the element falls back to its
+   natural (left-aligned, in-flow) document position -- which reads as
+   "the bot is showing on the left" instead of floating bottom-right. */
+.st-key-chat_fab {
+    position: fixed !important; top: auto !important; left: auto !important;
+    bottom: 24px !important; right: 24px !important; z-index: 9998 !important;
+}
 .st-key-chat_fab button {
     width: 56px !important; height: 56px !important; border-radius: 50% !important;
     background: #0D94FB !important; color: #fff !important; border: none !important;
@@ -40,7 +48,8 @@ CSS = """
 }
 
 .st-key-chat_panel {
-    position: fixed !important; bottom: 90px; right: 24px; z-index: 9999; width: 280px;
+    position: fixed !important; top: auto !important; left: auto !important;
+    bottom: 90px !important; right: 24px !important; z-index: 9999 !important; width: 280px !important;
     background: #fff; border-radius: 16px; border: 1px solid #E5E8EC;
     box-shadow: 0 12px 40px rgba(1,38,82,0.16);
     transition: opacity 200ms ease-out, transform 200ms ease-out, max-height 200ms ease-out;
