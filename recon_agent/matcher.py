@@ -361,6 +361,12 @@ def reconcile(invoices: list[dict], settlements: list[dict], use_llm: bool = Tru
     passed straight through to llm_reasoner.investigate() so app.py can
     surface "retrying (attempt 2/3)..." in the UI (item 4)."""
     results = []
+    # One circuit breaker per run, shared across every L5 call in this batch
+    # -- see llm_reasoner.investigate()'s docstring for why: a 429 on the
+    # first unresolved settlement means every later one would hit the same
+    # wall, and paying the full retry-and-backoff cost N times over instead
+    # of once was measured to turn a sub-second run into a multi-minute one.
+    llm_circuit: dict = {"open": False}
 
     for settlement in settlements:
         open_invoices = [inv for inv in invoices if inv["status"] != "closed"]
@@ -457,7 +463,8 @@ def reconcile(invoices: list[dict], settlements: list[dict], use_llm: bool = Tru
         # --- Layer 5: Tier-1 Exception Investigator (bounded, read-only, proposal only) ---
         if result is None and "L5" in enabled_layers:
             candidates = build_fuzzy_candidates(open_invoices, settlement)
-            inv_result = investigate(settlement, candidates, use_llm=use_llm, on_retry=on_llm_retry)
+            inv_result = investigate(settlement, candidates, use_llm=use_llm, on_retry=on_llm_retry,
+                                     circuit_breaker=llm_circuit)
             if inv_result.chosen_invoice_ids:
                 # item 5: a proposal can now be a batch (>1 invoice_id), not
                 # just the single top candidate -- surfaced with one combined

@@ -1205,10 +1205,13 @@ elif active_tab == "Model diagnostics":
     # ---- (b) per-layer ablation, pulled from evaluate.py -------------------
     st.markdown("**Per-layer ablation**")
     st.caption("Each layer disabled in turn, on this exact batch — a real rerun via evaluate.py, "
-              "not a canned chart.")
+              "not a canned chart. Always deterministic (no live LLM calls), regardless of the "
+              "sidebar toggle: this measures the matcher's own layer-by-layer contribution, and "
+              "6 reruns' worth of live calls would make it slow without changing what it's "
+              "actually measuring.")
     if st.button("Run ablation on this batch", key="diag_run_ablation"):
         with st.spinner("Reconciling with each layer disabled in turn…"):
-            st.session_state["diag_ablation"] = _eval.ablation(DATA_DIR, use_llm=use_llm)
+            st.session_state["diag_ablation"] = _eval.ablation(DATA_DIR, use_llm=False)
     if st.session_state.get("diag_ablation"):
         abl = st.session_state["diag_ablation"]
         abl_df = pd.DataFrame({"auto_match_rate": {k: v["auto_match_rate"] for k, v in abl.items()}})
@@ -1227,14 +1230,16 @@ elif active_tab == "Model diagnostics":
     st.markdown("**Mean ± std across 5 seeds**")
     st.caption("The demo batch alone is one seed — this reruns the full pipeline on 5 freshly "
               "generated seeds at the current batch size so the headline numbers aren't read "
-              "off a single lucky (or unlucky) run.")
+              "off a single lucky (or unlucky) run. Always deterministic (no live LLM calls) — "
+              "5 fresh synthetic batches' worth of live calls would be slow and would measure "
+              "API variance, not matcher quality.")
     if st.button("Run 5-seed evaluation", key="diag_run_multiseed"):
         import tempfile
         with st.spinner("Generating and reconciling 5 seeds…"):
             n_settlements_guess = metrics["total_settlements"]
             with tempfile.TemporaryDirectory(prefix="recon_diag_") as scratch_dir:
                 st.session_state["diag_multiseed"] = _eval.multi_seed(
-                    scratch_dir, [101, 102, 103, 104, 105], n_settlements_guess, use_llm=use_llm)
+                    scratch_dir, [101, 102, 103, 104, 105], n_settlements_guess, use_llm=False)
     if st.session_state.get("diag_multiseed"):
         ms = st.session_state["diag_multiseed"]
         mcols = st.columns(4)
