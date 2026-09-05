@@ -17,12 +17,14 @@ import pandas as pd
 import streamlit as st
 
 from data_gen import generate
-from recon_agent import anomaly, assistant, chat_widget, motion, ops, rules as rules_mod
+from recon_agent import (anomaly, assistant, chat_widget, insights, motion, ops,
+                         rules as rules_mod)
 from recon_agent.audit import AuditLog, entries_for_txn, load_chain, replay_txn, verify_chain
 from recon_agent.matcher import load_settlements, run_reconciliation
 from recon_agent.ui_theme import (CSS, STATUS_LABEL, autonomy_badge, band_for, band_row,
-                                  because_sentence, confidence_pill, fmt_inr, icon,
-                                  mini_pipeline, sparkline_svg, status_row, tag, trend_arrow)
+                                  because_sentence, confidence_pill, fmt_inr,
+                                  fmt_inr_compact, icon, mini_pipeline, sparkline_svg,
+                                  status_row, tag, trend_arrow)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 INV_CSV = os.path.join(DATA_DIR, "invoices.csv")
@@ -567,20 +569,180 @@ if active_tab == "Overview":
     c6.metric("Recall", pct("recall"))
     c7.metric("Deduction-hypothesis accuracy", pct("deduction_hypothesis_accuracy"))
 
+    # ---- value-weighted exposure: the money view, not the row view -------
+    # Reconciliation practice reads the unreconciled *balance* first and the
+    # row count second -- ten small exceptions carry less risk than one
+    # large unresolved variance. Everything above this line is
+    # record-weighted; everything below is rupee-weighted.
     st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
-    dr = pd.to_datetime([enriched.get(s["txn_id"], {}).get("txn_date") for s in settlements
-                        if enriched.get(s["txn_id"], {}).get("txn_date")])
-    if len(dr):
-        st.date_input("Date range", value=(dr.min().date(), dr.max().date()),
-                      min_value=dr.min().date(), max_value=dr.max().date())
 
-    st.markdown("**Resolution layer breakdown**")
-    layer_counts = pd.Series([s["layer"] for s in settlements]).value_counts()
-    st.bar_chart(layer_counts, color="#0D94FB")
+    # the date filter genuinely scopes the value analytics below (it used to
+    # be rendered but wired to nothing at all)
+    _dates = [enriched.get(s["txn_id"], {}).get("txn_date") for s in settlements]
+    _dates = sorted({d for d in _dates if d})
+    scoped = settlements
+    if len(_dates) >= 2:
+        vh1, vh2 = st.columns([2, 1])
+        with vh1:
+            st.markdown("**Value & exposure**")
+            st.caption("Rupee-weighted view of the same batch. The pipeline-quality metrics "
+                      "above cover the whole run; this section respects the date range.")
+        with vh2:
+            _lo, _hi = pd.to_datetime(_dates[0]).date(), pd.to_datetime(_dates[-1]).date()
+            _picked = st.date_input("Settlement date range", value=(_lo, _hi),
+                                    min_value=_lo, max_value=_hi, key="ov_date_range")
+        if isinstance(_picked, (tuple, list)) and len(_picked) == 2:
+            _from, _to = _picked
+            scoped = [s for s in settlements
+                     if (_d := enriched.get(s["txn_id"], {}).get("txn_date"))
+                     and _from <= pd.to_datetime(_d).date() <= _to]
+    else:
+        st.markdown("**Value & exposure**")
 
-    if len(history) >= 2:
-        st.markdown("**Auto-match rate trend across runs**")
-        st.line_chart(pd.DataFrame(history)[["auto_match_rate"]])
+    if not scoped:
+        st.markdown('<p class="rp-empty">No settlements in the selected date range.</p>',
+                   unsafe_allow_html=True)
+    else:
+        vs = insights.value_summary(scoped, enriched, effective_status)
+        VALUE_TILES = [
+            ("Total settled", vs["total_value"], "#012652", None),
+            ("Reconciled", vs["matched_value"], "#16A34A", vs["matched_value_pct"]),
+            ("Awaiting review", vs["pending_value"], "#D97706", None),
+            ("Unreconciled", vs["exception_value"], "#DC2626", None),
+        ]
+        vcols = st.columns(4)
+        for col, (label, amount, color, share) in zip(vcols, VALUE_TILES):
+            sub = f"{share*100:.1f}% of value" if share is not None else \
+                  (f"{amount / vs['total_value'] * 100:.1f}% of value" if vs["total_value"] else "—")
+            with col:
+                st.markdown(
+                    f'<div class="rp-card" style="padding:12px 14px">'
+                    f'<div style="color:#6B7280;font-size:11.5px">{label}</div>'
+                    f'<div class="rp-amount" style="font-size:1.35rem;color:{color};margin-top:3px">'
+                    f'{fmt_inr_compact(amount)}</div>'
+                    f'<div style="color:#6B7280;font-size:11px;margin-top:2px">{sub}</div>'
+                    f'</div>', unsafe_allow_html=True)
+
+        # the headline insight: when rupees and rows disagree, say so plainly
+        _gap = vs["value_vs_count_pp"]
+        if abs(_gap) >= 5:
+            if _gap < 0:
+                st.warning(f"**Value is reconciling worse than volume.** "
+                          f"{vs['matched_count_pct']*100:.1f}% of records auto-reconciled but only "
+                          f"{vs['matched_value_pct']*100:.1f}% of value ({abs(_gap):.1f}pp behind) — "
+                          f"the larger-ticket settlements are disproportionately the stuck ones, so "
+                          f"{fmt_inr(vs['at_risk_value'])} is still exposed. Clear by value, not by row count.")
+            else:
+                st.success(f"**Value is reconciling better than volume.** "
+                          f"{vs['matched_value_pct']*100:.1f}% of value cleared vs "
+                          f"{vs['matched_count_pct']*100:.1f}% of records ({_gap:.1f}pp ahead) — "
+                          f"what's left unresolved is mostly small-ticket.")
+        else:
+            st.caption(f"Value and volume are tracking together (within {abs(_gap):.1f}pp) — "
+                      f"no size bias in what's failing to reconcile. "
+                      f"{fmt_inr(vs['at_risk_value'])} still exposed across "
+                      f"{vs['pending_count'] + vs['exception_count']} record(s).")
+
+        # ---- fee/tax leakage  |  aging of unresolved ---------------------
+        st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+        lc, ac = st.columns(2)
+
+        with lc:
+            st.markdown("**Where the money went**")
+            leak = insights.deduction_leakage(scoped, invoices, enriched, effective_status)
+            if leak["n_settlements"]:
+                st.caption(f"Across {leak['n_settlements']} reconciled settlement(s) with a "
+                          f"detected deduction formula.")
+                rows = [("Gross invoiced", leak["gross"], "#1A1F2B", ""),
+                       ("Gateway fees", -leak["gateway_fees"], "#D97706", "deducted"),
+                       ("GST on fees", -leak["gst_on_fees"], "#D97706", "deducted"),
+                       ("TDS withheld", -leak["tds"], "#D97706", "deducted"),
+                       ("Net received", leak["net_received"], "#16A34A", "")]
+                body = "".join(
+                    f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
+                    f'border-bottom:1px solid #E5E8EC;font-size:12.5px">'
+                    f'<span style="color:#6B7280">{label}'
+                    f'{f" <span style=\'font-size:10.5px\'>({note})</span>" if note else ""}</span>'
+                    f'<span class="rp-amount" style="color:{color}">{fmt_inr(abs(amt))}</span></div>'
+                    for label, amt, color, note in rows)
+                st.markdown(f'<div class="rp-card">{body}'
+                           f'<div style="margin-top:8px;font-size:11.5px;color:#6B7280">'
+                           f'Effective deduction rate: <strong style="color:#012652">'
+                           f'{leak["effective_rate"]*100:.2f}%</strong> of gross</div></div>',
+                           unsafe_allow_html=True)
+            else:
+                st.markdown('<p class="rp-empty">No reconciled settlement in range carried a '
+                          'deduction formula — nothing to break down.</p>', unsafe_allow_html=True)
+
+        with ac:
+            st.markdown("**Aging of unreconciled items**")
+            unresolved = [s for s in scoped if effective_status(s) != "matched"]
+            if unresolved:
+                ag = insights.aging(unresolved, enriched)
+                st.caption(f"Measured from the date each settlement actually landed. "
+                          f"Oldest open item: **{ag['oldest_days']} days**.")
+                _max_v = max([b["value"] for b in ag["buckets"].values()] or [0]) or 1
+                BUCKET_COLOR = {"0-7 days": "#16A34A", "8-14 days": "#0D94FB",
+                               "15-30 days": "#D97706", "30+ days": "#DC2626"}
+                bars = ""
+                for label, b in ag["buckets"].items():
+                    pctw = b["value"] / _max_v * 100
+                    bars += (
+                        f'<div style="margin-bottom:9px">'
+                        f'<div style="display:flex;justify-content:space-between;font-size:11.5px;'
+                        f'margin-bottom:3px"><span style="color:#1A1F2B">{label} '
+                        f'<span style="color:#6B7280">({b["count"]})</span></span>'
+                        f'<span class="rp-amount" style="color:#012652">{fmt_inr_compact(b["value"])}</span></div>'
+                        f'<div style="height:6px;background:#F0F2F5;border-radius:3px;overflow:hidden">'
+                        f'<div class="rp-layerbar-seg" style="width:{pctw:.2f}%;height:100%;'
+                        f'background:{BUCKET_COLOR[label]}"></div></div></div>')
+                if ag["undated"]["count"]:
+                    bars += (f'<div style="font-size:11px;color:#6B7280;margin-top:4px">'
+                            f'{ag["undated"]["count"]} item(s) with no usable date</div>')
+                st.markdown(f'<div class="rp-card">{bars}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<p class="rp-empty">Nothing unreconciled in this range — '
+                          'the whole batch closed.</p>', unsafe_allow_html=True)
+
+        # ---- prioritized worklist: biggest exposure first ----------------
+        unresolved = [s for s in scoped if effective_status(s) != "matched"]
+        if unresolved:
+            st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+            st.markdown("**Clear these first — largest exposure**")
+            conc = insights.concentration(unresolved, enriched, top_n=5)
+            top = insights.top_exposure(unresolved, enriched, limit=5)
+            st.caption(f"The top {len(top)} of {len(unresolved)} unresolved item(s) carry "
+                      f"**{conc*100:.0f}%** of the total {fmt_inr(vs['at_risk_value'])} exposure "
+                      f"— clearing them removes most of the risk.")
+            hdr = ('<div class="rp-drawer-row head"><span>Transaction</span><span>Counterparty</span>'
+                  '<span>Status</span><span>Amount</span></div>')
+            body = "".join(
+                f'<div class="rp-drawer-row"><span class="rp-mono">{r["txn_id"]}</span>'
+                f'<span>{r["counterparty"] or "—"}</span>'
+                f'<span>{STATUS_LABEL.get(r["status"], r["status"])}</span>'
+                f'<span class="rp-amount">{fmt_inr(r["amount"])}</span></div>'
+                for r in top)
+            st.markdown(f'<div class="rp-card">{hdr}{body}</div>', unsafe_allow_html=True)
+
+    # ---- how it resolved / how it's trending, side by side ---------------
+    st.markdown('<hr class="rp-divider"/>', unsafe_allow_html=True)
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        st.markdown("**Resolution layer breakdown**")
+        layer_counts = pd.Series([LAYER_LABEL.get(s["layer"], s["layer"])
+                                 for s in settlements]).value_counts()
+        st.bar_chart(layer_counts, color="#0D94FB", height=260)
+    with bc2:
+        if len(history) >= 2:
+            st.markdown("**Auto-match rate across runs**")
+            _hist = pd.DataFrame(history)
+            _hist.index = range(1, len(_hist) + 1)
+            _hist.index.name = "Run"
+            st.line_chart(_hist[["auto_match_rate"]], color="#0D94FB", height=260)
+        else:
+            st.markdown("**Auto-match rate across runs**")
+            st.markdown('<p class="rp-empty">Only one run so far — run reconciliation again '
+                       '(or change the seed) to start a trend line.</p>', unsafe_allow_html=True)
 
 # ==========================================================================
 # RECONCILIATION

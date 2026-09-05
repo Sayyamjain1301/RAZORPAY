@@ -403,6 +403,23 @@ def tag(text: str | None) -> str:
     return f'<span class="rp-tag">{text}</span>'
 
 
+def fmt_inr_compact(amount) -> str:
+    """Short form for KPI tiles, in the lakh/crore convention an Indian
+    finance team actually reads: 4523.1 -> '₹4,523', 152000 -> '₹1.52L',
+    31500000 -> '₹3.15Cr'. Full precision still belongs in tables and the
+    row-level math panel — this is for headline tiles only, where the exact
+    paise matter less than the magnitude landing instantly."""
+    if amount is None:
+        return "—"
+    sign = "-" if amount < 0 else ""
+    a = abs(float(amount))
+    if a >= 1e7:
+        return f"{sign}₹{a / 1e7:.2f}Cr"
+    if a >= 1e5:
+        return f"{sign}₹{a / 1e5:.2f}L"
+    return f"{sign}{fmt_inr(round(a))[:-3] if fmt_inr(round(a)).endswith('.00') else fmt_inr(round(a))}"
+
+
 def fmt_inr(amount) -> str:
     """Indian digit grouping, tabular-nums applied via .rp-amount at render
     sites. 12345678.9 -> '₹1,23,45,678.90'"""
