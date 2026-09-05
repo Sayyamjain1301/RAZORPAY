@@ -139,7 +139,7 @@ h1, h2, h3 {{ letter-spacing: -0.02em; font-weight: 700; color: {PRUSSIAN_BLUE};
 /* ---- top nav bar (Prussian Blue) ---- */
 .st-key-topnav {{ background: {PRUSSIAN_BLUE}; padding: 14px 20px; border-radius: 0; margin: -1rem -1rem 1rem -1rem; }}
 .st-key-topnav p, .st-key-topnav span, .st-key-topnav div {{ color: {WHITE} !important; }}
-.st-key-topnav [data-testid="stCaptionContainer"] {{ color: #A9C4E0 !important; }}
+.st-key-topnav [data-testid="stCaptionContainer"] {{ color: rgba(255,255,255,0.65) !important; }}
 
 /* ---- bottom bulk bar (Prussian Blue) ---- */
 .st-key-bulkbar {{ background: {PRUSSIAN_BLUE}; padding: 12px 18px; border-radius: 8px; }}
@@ -259,7 +259,7 @@ input::placeholder, textarea::placeholder {{ color: {SLATE} !important; }}
 }}
 .rp-tour-title {{ display:flex; align-items:center; gap:7px; font-weight:700; color:{WHITE}; font-size:13.5px; margin-bottom:4px; }}
 .rp-tour-title svg {{ stroke:{DODGER_BLUE}; }}
-.rp-tour-text {{ color:#C7D3E0; font-size:12.5px; line-height:1.5; margin-bottom:10px; }}
+.rp-tour-text {{ color:rgba(255,255,255,0.75); font-size:12.5px; line-height:1.5; margin-bottom:10px; }}
 .st-key-tour_overlay button {{ font-size:12px !important; }}
 </style>
 """

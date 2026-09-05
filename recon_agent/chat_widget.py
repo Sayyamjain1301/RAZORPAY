@@ -29,9 +29,11 @@ CSS = """
 .st-key-chat_fab button {
     width: 56px !important; height: 56px !important; border-radius: 50% !important;
     background: #0D94FB !important; color: #fff !important; border: none !important;
-    box-shadow: 0 4px 16px rgba(1,38,82,0.25) !important; transition: background-color 150ms ease-out !important;
+    box-shadow: 0 4px 16px rgba(1,38,82,0.25) !important; transition: filter 150ms ease-out !important;
 }
-.st-key-chat_fab button:hover { background: #0B85E0 !important; }
+/* darken on hover via filter, not a hand-picked hex -- stays literally
+   Dodger Blue, never introduces an off-palette shade */
+.st-key-chat_fab button:hover { filter: brightness(0.88) !important; }
 @keyframes rp-chat-pulse {
     0%   { box-shadow: 0 0 0 0 rgba(13,148,251,0.55), 0 4px 16px rgba(1,38,82,0.25); }
     100% { box-shadow: 0 0 0 20px rgba(13,148,251,0), 0 4px 16px rgba(1,38,82,0.25); }

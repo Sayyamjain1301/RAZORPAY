@@ -121,7 +121,7 @@ input[type="checkbox"], input, textarea, select {{
 }}
 .rp-skel-row {{
     height: 34px; border-radius: 4px; margin-bottom: 8px;
-    background: linear-gradient(90deg, #F5F7FA 25%, #ECEFF3 37%, #F5F7FA 63%);
+    background: linear-gradient(90deg, #F5F7FA 25%, #E5E8EC 37%, #F5F7FA 63%);
     background-size: 600px 100%;
     animation: rp-shimmer 1.5s linear infinite;
 }}

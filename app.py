@@ -67,12 +67,17 @@ for _key_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
 
 st.session_state.setdefault("dark_mode", False)
 if st.session_state["dark_mode"]:
+    # Dark mode is Prussian Blue itself as the base (see its "dark-mode
+    # base" comment in ui_theme.py), with everything else a White-at-
+    # various-opacity derivation on top -- no separate near-black gray
+    # scale invented for it, so it stays strictly Razorpay Blue + White.
     st.markdown("""<style>
-        [data-testid="stAppViewContainer"] { background: #0F1216 !important; }
-        [data-testid="stSidebar"] { background: #14171C !important; }
-        .rp-card { background: #191D22 !important; border-color: #2A2F36 !important; }
-        body, p, span, div, label, li { color: #E6E9EE; }
-        [data-testid="stMetricLabel"] { color: #8C94A0 !important; }
+        [data-testid="stAppViewContainer"] { background: #012652 !important; }
+        [data-testid="stSidebar"] { background: #012652 !important;
+            border-right: 1px solid rgba(255,255,255,0.12) !important; }
+        .rp-card { background: rgba(255,255,255,0.06) !important; border-color: rgba(255,255,255,0.15) !important; }
+        body, p, span, div, label, li { color: rgba(255,255,255,0.92); }
+        [data-testid="stMetricLabel"] { color: rgba(255,255,255,0.55) !important; }
     </style>""", unsafe_allow_html=True)
 
 for key, default in [
@@ -713,7 +718,7 @@ if active_tab == "Overview":
                         f'margin-bottom:3px"><span style="color:#1A1F2B">{label} '
                         f'<span style="color:#6B7280">({b["count"]})</span></span>'
                         f'<span class="rp-amount" style="color:#012652">{fmt_inr_compact(b["value"])}</span></div>'
-                        f'<div style="height:6px;background:#F0F2F5;border-radius:3px;overflow:hidden">'
+                        f'<div style="height:6px;background:#E5E8EC;border-radius:3px;overflow:hidden">'
                         f'<div class="rp-layerbar-seg" style="width:{pctw:.2f}%;height:100%;'
                         f'background:{BUCKET_COLOR[label]}"></div></div></div>')
                 if ag["undated"]["count"]:
@@ -856,18 +861,22 @@ elif active_tab == "Reconciliation":
     from collections import Counter as _Counter
     layer_counts = _Counter(s["layer"] for s in settlements)
     total_n = sum(layer_counts.values()) or 1
+    # Every shade here is Dodger Blue or Prussian Blue at a different
+    # opacity, never a new hue -- "the only accent" per ui_theme.py's brand
+    # rule still holds; only alpha varies, so 6 layers stay distinguishable
+    # without introducing off-palette blues.
     LAYER_COLOR = {
-        "exact_reference+deduction_engine": "#0D94FB",
-        "exact_reference+partial_payment": "#4DB1FC",
-        "exact_reference_batch+deduction_engine": "#7EC5FD",
-        "anchored_batch_completion": "#012652",
-        "amount_date_subset_sum": "#2D5C8A",
-        "llm_investigator": "#B9C6D6",
+        "exact_reference+deduction_engine": "rgba(13,148,251,1)",
+        "exact_reference+partial_payment": "rgba(13,148,251,0.7)",
+        "exact_reference_batch+deduction_engine": "rgba(13,148,251,0.4)",
+        "anchored_batch_completion": "rgba(1,38,82,1)",
+        "amount_date_subset_sum": "rgba(1,38,82,0.6)",
+        "llm_investigator": "#6B7280",  # SLATE -- the one non-deterministic layer, neutral by design
     }
     st.session_state.setdefault("layer_filter_active", None)
     segs_html = "".join(
         f'<div class="rp-layerbar-seg" style="width:{c/total_n*100:.3f}%;'
-        f'background:{LAYER_COLOR.get(l, "#B9C6D6")}"></div>'
+        f'background:{LAYER_COLOR.get(l, "#6B7280")}"></div>'
         for l, c in layer_counts.items()
     )
     st.markdown(f'<div class="rp-layerbar">{segs_html}</div>', unsafe_allow_html=True)
